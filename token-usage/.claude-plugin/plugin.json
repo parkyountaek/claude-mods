@@ -1,6 +1,54 @@
 {
   "name": "token-usage",
-  "version": "0.1.0",
-  "description": "Context window fill and input/output tokens: band above the prompt, status entry, and a /token-usage pane",
-  "types": "./types/index.d.ts"
+  "version": "0.2.0",
+  "description": "입력창 위 한 줄: 컨텍스트 사용량, 사용 한도, 메인·서브에이전트 모델과 effort. 서브에이전트 이름을 누르면 작업 내용 창이 열립니다",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "parkyountaek"
+  },
+  "userConfig": {
+    "band": {
+      "type": "boolean",
+      "title": "입력창 위 사용량 줄",
+      "description": "컨텍스트(대화 기억) 사용량, 사용 한도, 모델을 입력창 위에 한 줄로 보여줍니다. 꺼도 /token-usage 로 펼쳐 볼 수 있습니다.",
+      "default": true
+    },
+    "resetTimes": {
+      "type": "boolean",
+      "title": "사용 한도 초기화 시간",
+      "description": "5시간·7일 사용 한도 옆에 다시 채워지기까지 남은 시간(↻2h)을 붙입니다.",
+      "default": false
+    },
+    "agentRows": {
+      "type": "string",
+      "title": "서브에이전트 줄 수",
+      "description": "입력창 위에 한 줄씩 보여줄 서브에이전트 수. 넘치면 '외 N개 더 보기'로 묶입니다.",
+      "default": "5",
+      "options": [
+        "3",
+        "5",
+        "8",
+        "끄기"
+      ]
+    },
+    "agentActivity": {
+      "type": "boolean",
+      "title": "서브에이전트가 지금 보는 것",
+      "description": "각 서브에이전트 줄 끝에 마지막으로 연 파일이나 실행한 명령을 보여줍니다.",
+      "default": true
+    },
+    "theme": {
+      "type": "string",
+      "title": "색 테마",
+      "description": "'파일 설정 따름'이면 /token-usage theme 으로 고른 테마(theme.json)를 씁니다.",
+      "default": "파일 설정 따름",
+      "options": [
+        "파일 설정 따름",
+        "default",
+        "colorblind",
+        "ocean",
+        "vivid"
+      ]
+    }
+  }
 }

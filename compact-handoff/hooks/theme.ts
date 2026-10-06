@@ -83,7 +83,7 @@ export const applyThemeArgs = (now: ThemeFile, args: readonly string[]): { text:
   const [verb, a, b] = args
   if (verb === 'theme') {
     if (!a) return { text: show(now) }
-    if (!PRESETS[a]) return { text: `Unknown theme "${a}". Pick one of: ${Object.keys(PRESETS).join(', ')}` }
+    if (!PRESETS[a]) return { text: `"${a}" 테마는 없습니다. 고를 수 있는 테마: ${Object.keys(PRESETS).join(', ')}` }
     const next = { preset: a, overrides: {} }
     return { text: show(next), next }
   }
@@ -92,7 +92,7 @@ export const applyThemeArgs = (now: ThemeFile, args: readonly string[]): { text:
     return { text: show(next), next }
   }
   if (!a || !b || !SLOTS.includes(a as Slot) || !isColor(b)) {
-    return { text: `Usage: color <${SLOTS.join('|')}> <#RRGGBB or theme key>, or color reset` }
+    return { text: `사용법: color <${SLOTS.join('|')}> <#RRGGBB 색 코드>, 되돌리기: color reset` }
   }
   const next = { ...now, overrides: { ...now.overrides, [a]: b } }
   return { text: show(next), next }

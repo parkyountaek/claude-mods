@@ -154,13 +154,13 @@ async function themeCommand($: EngineInterface, words: string[]): Promise<string
       .ask('어떤 색상 테마를 쓸까요?', { header: '테마', options: names.map(n => `${n} — ${THEME_HELP[n] ?? ''}`) })
       .catch(() => '')
     const name = names.find(n => picked.startsWith(n))
-    if (!name) return 'Theme unchanged.'
+    if (!name) return '테마를 바꾸지 않았습니다.'
     words = ['theme', name]
   }
   const r = applyThemeArgs(await loadTheme($), words)
   if (r.next) {
     const theme = r.next
-    await $.fs.write(themePath(await $.env.get('HOME'), await $.env.get('CLAUDE_MODS_THEME_FILE')), `${JSON.stringify(theme, null, 2)}\n`)
+    await $.fs.write(themePath(await $.env.get('HOME'), await $.env.get('CLAUDE_MODS_THEME_FILE')), `${JSON.stringify(theme, null, 2)}\n`).catch(() => undefined)
     await update($, summary, s => ({ ...s, theme }))
   }
   return r.text
@@ -186,16 +186,25 @@ async function refreshSummary($: EngineInterface) {
   }))
 }
 
-export const register: Register = on => {
+async function setOption($: EngineInterface, field: string, value: boolean): Promise<boolean> {
+  const r = await $.config.set({ key: `compact-handoff.${field}`, value }).catch(() => ({ deny: 'error' }))
+  return !('deny' in r && r.deny !== undefined)
+}
+
+// Settings come from /config (userConfig); a change there reloads the module.
+export const register: Register = (on, options) => {
+  const isBandOn = options.band !== false
+  let isHandoffOn = options.handoff !== false
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'handoff',
-      description: 'Show the handoff note pinned at the last compaction, preview the next one, or turn pinning on/off',
+      description: '대화 압축 때 남긴 이어가기 메모 보기 (preview: 지금 압축하면 남길 메모, on|off: 켜기/끄기)',
       argumentHint: '[preview|on|off]',
     })
     await $.command.register({
       name: 'work',
-      description: 'Fold or unfold the work summary above the prompt (tasks, requests, files, failures); theme picks colors',
+      description: '입력창 위 할 일 요약 펼치기/접기 (할 일, 요청, 파일, 실패한 검사)',
       argumentHint: '[open|close|band on|off|theme [name]|color <slot> <#hex>]',
     })
     const started = await next(e)
@@ -206,15 +215,15 @@ export const register: Register = on => {
   on('command.run', { command: 'handoff' }, async ($, e) => {
     const arg = e.args.trim()
     if (arg === 'on' || arg === 'off') {
-      await $.store.set('isOff', arg === 'off')
-      return { text: `Handoff note ${arg === 'off' ? 'off: compaction runs as the engine does' : 'on'}.` }
+      if (!(await setOption($, 'handoff', arg === 'on'))) isHandoffOn = arg === 'on'
+      return { text: arg === 'off' ? '이어가기 메모 끔: 압축은 기본 방식대로 진행됩니다.' : '이어가기 메모 켬.' }
     }
     if (arg === 'preview') {
       const cwd = await $.session.cwd().catch(() => '')
       return { text: render(collect(await $.session.messages()), cwd) }
     }
     const saved = (await $.store.get('last')) as { at: string; note: string } | undefined
-    return { text: saved ? `Last handoff (${saved.at}):\n\n${saved.note}` : 'No compaction yet. Try /handoff preview.' }
+    return { text: saved ? `마지막 이어가기 메모 (${saved.at}):\n\n${saved.note}` : '아직 압축된 적이 없습니다. /handoff preview 로 미리 볼 수 있습니다.' }
   })
 
   on('command.run', { command: 'work' }, async ($, e) => {
@@ -222,16 +231,16 @@ export const register: Register = on => {
     const words = arg.split(/\s+/)
     if (words[0] === 'theme' || words[0] === 'color') return { text: await themeCommand($, words) }
     if (arg === 'band off' || arg === 'band on') {
-      await update($, summary, s => ({ ...s, isBandHidden: arg === 'band off' }))
-      return { text: `Work band ${arg === 'band off' ? 'hidden' : 'shown'}.` }
+      if (!(await setOption($, 'band', arg === 'band on'))) await update($, summary, s => ({ ...s, isBandHidden: arg === 'band off' }))
+      return { text: arg === 'band off' ? '할 일 진행 줄을 숨겼습니다.' : '할 일 진행 줄을 보여줍니다.' }
     }
     if (arg === 'close' || arg === 'open' || arg === '') {
       await refreshSummary($)
       const isExpanded = arg === 'open' || (arg === '' && !(await read($, summary)).isExpanded)
       await update($, summary, s => ({ ...s, isExpanded, isBandHidden: false }))
-      return { text: isExpanded ? 'Work details shown above the prompt. /work again folds them.' : 'Work details folded.' }
+      return { text: isExpanded ? '할 일 요약을 펼쳤습니다. /work 를 한 번 더 입력하면 접힙니다.' : '할 일 요약을 접었습니다.' }
     }
-    return { text: 'Usage: /work [open|close|band on|off|theme [name]|color <slot> <#hex>]' }
+    return { text: '사용법: /work (펼치기/접기), /work band on|off, /work theme' }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -244,7 +253,7 @@ export const register: Register = on => {
     const ran = await next(e)
     if (TRACKED.includes(e.tool)) await refreshSummary($)
     return ran
-  })
+  }).catch(($, e, next) => next(e))
 
   // ------------------------------------------------------------ band
 
@@ -255,7 +264,7 @@ export const register: Register = on => {
     const { done, total, current } = progress(hand.tasks)
     const latest = hand.prompts.at(-1)
     // Collapsed, the band shows task progress only; the last request is in /work.
-    if (e.props.hasSurvey || s.isBandHidden || (!total && (!latest || !s.isExpanded))) return below
+    if (e.props.hasSurvey || s.isBandHidden || (!isBandOn && !s.isExpanded) || (!total && (!latest || !s.isExpanded))) return below
 
     const { Box, Text } = $.ui.resolve(e)
     const P = palette(s.theme as ThemeFile)
@@ -351,7 +360,7 @@ export const register: Register = on => {
   on('session.compact', async ($, e, next) => {
     // Main conversation only; a precompute is kept for later and would go stale.
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
-    if ((await $.store.get('isOff').catch(() => false)) === true) return next(e)
+    if (!isHandoffOn) return next(e)
 
     const handoff = collect(e.messages)
     const cwd = await $.session.cwd().catch(() => '')
@@ -373,5 +382,5 @@ export const register: Register = on => {
       { timeoutMs: 6000 },
     )
     return { ...done, messages }
-  })
+  }).catch(($, e, next) => next(e))
 }

@@ -9,6 +9,11 @@ export type TurnRow = Tokens & { model: string }
 
 export type AgentRow = Tokens & {
   id: string
+  // Order of first appearance in the session: its ①② mark and color, never reused.
+  seq?: number
+  // When it was first seen and when its run ended (ms), for the elapsed time.
+  startedAt?: number
+  endedAt?: number
   type: string
   description: string
   model: string
@@ -40,8 +45,10 @@ export type Usage = {
   theme?: { preset: string; overrides: Record<string, string> }
   // The band above the prompt drawn in detail (toggled by /token-usage).
   isExpanded?: boolean
-  // The subagent whose transcript the agent pane shows.
+  // The subagent whose transcript the agent pane shows, while that pane is open.
   viewing?: string
+  // The next subagent's seq.
+  nextSeq?: number
 }
 
 declare module 'claude-code' {

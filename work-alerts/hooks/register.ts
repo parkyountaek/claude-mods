@@ -1,8 +1,16 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// Preferences live in $.store so they survive across sessions.
-type Prefs = { isOn: boolean; hasSound: boolean; hasDesktop: boolean; longTurnSec: number }
-const DEFAULTS: Prefs = { isOn: true, hasSound: true, hasDesktop: true, longTurnSec: 60 }
+// Settings come from /config (this plugin's userConfig); a change there reloads the module.
+type Prefs = { isOn: boolean; hasSound: boolean; hasDesktop: boolean; longTurnSec: number; subagent: string }
+const LONG_TURN: Record<string, number> = { '30초': 30, '60초': 60, '2분': 120, '5분': 300 }
+
+export const prefsFrom = (o: Readonly<Record<string, unknown>>): Prefs => ({
+  isOn: o.enabled !== false,
+  hasSound: o.sound !== false,
+  hasDesktop: o.desktop !== false,
+  longTurnSec: LONG_TURN[String(o.longTurn)] ?? 60,
+  subagent: typeof o.subagent === 'string' ? o.subagent : '알림 창만',
+})
 
 const SOUND = {
   done: '/System/Library/Sounds/Glass.aiff',
@@ -35,29 +43,45 @@ export const crossed = (before: number, now: number, levels: readonly number[]):
 
 const quote = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 
-// Module-level so `alert` can be a top-level function; reloaded from $.store each session.start.
-let prefs: Prefs = DEFAULTS
+let prefs: Prefs = prefsFrom({})
+// Several alerts at once (parallel subagents finishing) play one sound.
+let lastSoundAt = 0
 
-async function alert($: EngineInterface, text: string, kind: keyof typeof SOUND, isDesktop = false) {
+async function alert($: EngineInterface, text: string, kind: keyof typeof SOUND, isDesktop = false, hasSound = true) {
   if (!prefs.isOn) return
   $.ui.toast(text, { timeoutMs: kind === 'fail' ? 8000 : 5000 })
-  if (prefs.hasSound) void $.process.run(['afplay', SOUND[kind]]).catch(() => undefined)
+  const now = await $.clock.now()
+  if (prefs.hasSound && hasSound && now - lastSoundAt > 2000) {
+    lastSoundAt = now
+    void $.process.run(['afplay', SOUND[kind]]).catch(() => undefined)
+  }
   if (prefs.hasDesktop && isDesktop) {
     const script = `display notification "${quote(text)}" with title "Claude Code"`
     void $.process.run(['osascript', '-e', script]).catch(() => undefined)
   }
 }
 
-export const register: Register = on => {
-  let lastContext = 0
+const flag = (x: boolean) => (x ? '켜짐' : '꺼짐')
+const describe = (p: Prefs) =>
+  `작업 알림 ${flag(p.isOn)} · 알림음 ${flag(p.hasSound)} · macOS 알림 창 ${flag(p.hasDesktop)} · ${p.longTurnSec}초 넘게 걸린 답변만 알림 · 서브에이전트: ${p.subagent}`
+
+// Commands write through /config, so the menu and the commands never disagree.
+async function setOption($: EngineInterface, field: string, value: boolean | string): Promise<boolean> {
+  const r = await $.config.set({ key: `work-alerts.${field}`, value }).catch(() => ({ deny: 'error' }))
+  return !('deny' in r && r.deny !== undefined)
+}
+
+export const register: Register = (on, options) => {
+  prefs = prefsFrom(options)
+  // undefined until the first reading, so a session that starts above a line does not alert.
+  let lastContext: number | undefined
   const lastLimit = new Map<string, number>()
 
   on('session.start', async ($, e, next) => {
-    prefs = { ...DEFAULTS, ...((await $.store.get('prefs')) as Partial<Prefs> | undefined) }
     await $.command.register({
       name: 'alerts',
-      description: 'Work alerts: on|off, sound on|off, desktop on|off, long <seconds>, test',
-      argumentHint: '[on|off|sound on|off|desktop on|off|long <sec>|test]',
+      description: '작업 알림 설정 보기 (바꾸기: /config 의 work-alerts, 시험: /alerts test)',
+      argumentHint: '[test]',
     })
     await $.command.register({ name: 'task-alert', description: '작업 알림음 켜기/끄기 (on|off, 비우면 전환)', argumentHint: '[on|off]' })
     return next(e)
@@ -66,26 +90,17 @@ export const register: Register = on => {
   // /task-alert flips the alert sound; toasts and desktop notices are untouched.
   on('command.run', { command: 'task-alert' }, async ($, e) => {
     const a = e.args.trim()
-    prefs = { ...prefs, hasSound: a === 'on' ? true : a === 'off' ? false : !prefs.hasSound }
-    await $.store.set('prefs', prefs)
-    return { text: prefs.hasSound ? '🔔 알림음 켬' : '🔕 알림음 끔 (알림 창은 그대로 뜹니다)' }
+    const hasSound = a === 'on' ? true : a === 'off' ? false : !prefs.hasSound
+    if (!(await setOption($, 'sound', hasSound))) prefs = { ...prefs, hasSound }
+    return { text: hasSound ? '🔔 알림음 켬' : '🔕 알림음 끔 (알림 창은 그대로 뜹니다)' }
   })
 
   on('command.run', { command: 'alerts' }, async ($, e) => {
-    const [a, b] = e.args.trim().split(/\s+/)
-    if (a === 'on' || a === 'off') prefs = { ...prefs, isOn: a === 'on' }
-    else if (a === 'sound' && (b === 'on' || b === 'off')) prefs = { ...prefs, hasSound: b === 'on' }
-    else if (a === 'desktop' && (b === 'on' || b === 'off')) prefs = { ...prefs, hasDesktop: b === 'on' }
-    else if (a === 'long' && Number(b) > 0) prefs = { ...prefs, longTurnSec: Number(b) }
-    else if (a === 'test') {
+    if (e.args.trim() === 'test') {
       await alert($, '🔔 알림 테스트입니다', 'done', true)
-      return { text: 'Test alert sent.' }
+      return { text: prefs.isOn ? '시험 알림을 보냈습니다.' : '작업 알림이 꺼져 있어 시험 알림도 나오지 않습니다. /config 에서 켜세요.' }
     }
-    await $.store.set('prefs', prefs)
-    const flag = (x: boolean) => (x ? 'on' : 'off')
-    return {
-      text: `Alerts ${flag(prefs.isOn)} · sound ${flag(prefs.hasSound)} · desktop ${flag(prefs.hasDesktop)} · long turn ≥ ${prefs.longTurnSec}s`,
-    }
+    return { text: `${describe(prefs)}\n바꾸려면 /config 에서 work-alerts 항목을 고르세요.` }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -94,8 +109,10 @@ export const register: Register = on => {
     if (e.agentId !== undefined) {
       const info = (await $.agent.list()).find(a => a.id === e.agentId)
       const name = info ? `${info.type}${info.description ? ` · ${info.description}` : ''}` : '서브에이전트'
-      if (e.reason === 'error') await alert($, `🤖✗ ${name} 실패 (${took})`, 'fail')
-      else if (!e.isAborted) await alert($, `🤖✓ ${name} 완료 (${took})`, 'done')
+      if (prefs.subagent === '끄기') return done
+      const hasSound = prefs.subagent === '알림 창과 소리'
+      if (e.reason === 'error') await alert($, `🤖✗ ${name} 실패 (${took})`, 'fail', false, hasSound)
+      else if (!e.isAborted) await alert($, `🤖✓ ${name} 끝남 (${took})`, 'done', false, hasSound)
       return done
     }
     if (e.reason === 'error') await alert($, `✗ 오류로 멈춤 (${took})`, 'fail', true)
@@ -115,19 +132,19 @@ export const register: Register = on => {
       await alert($, `🧪✗ ${tool} 실패${why ? `: ${why}` : ''}`, 'fail')
     }
     return ran
-  })
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     const pct = e.context.percent
     if (pct !== undefined) {
-      const hit = crossed(lastContext, pct, [60, 85])
+      const hit = lastContext === undefined ? undefined : crossed(lastContext, pct, [60, 85])
       if (hit === 85) await alert($, `● 컨텍스트 ${pct}% — 곧 자동 압축됩니다`, 'warn')
       else if (hit === 60) await alert($, `◕ 컨텍스트 ${pct}% 사용 중`, 'warn')
       lastContext = pct
     }
     for (const limit of e.rateLimits) {
-      const before = lastLimit.get(limit.kind) ?? 0
-      const hit = crossed(before, limit.percentUsed, [80, 95])
+      const before = lastLimit.get(limit.kind)
+      const hit = before === undefined ? undefined : crossed(before, limit.percentUsed, [80, 95])
       if (hit !== undefined) {
         const label = limit.kind === 'five_hour' ? '5시간' : limit.kind === 'seven_day' ? '7일' : limit.kind
         await alert($, `⏳ ${label} 사용 한도 ${limit.percentUsed}%`, 'warn', hit === 95)

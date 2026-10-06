@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { crossed, duration, failSummary } from '../hooks/register'
+import { crossed, duration, failSummary, prefsFrom } from '../hooks/register'
 
 test('durations read in Korean units', async () => {
   expect(duration(4_200)).toBe('4초')
@@ -21,10 +21,9 @@ test('alerts once per upward crossing', async () => {
   expect(crossed(90, 20, [60, 85])).toBeUndefined()
 })
 
-test('/task-alert toggles the alert sound and keeps it', async ($, on) => {
-  const saved = new Map<string, unknown>()
-  on('store.set', (_$, e) => (saved.set(e.key, e.value), { value: undefined }))
-  on('store.get', (_$, e) => ({ value: saved.get(e.key) }))
+test('/task-alert writes the sound row of /config', async ($, on) => {
+  const set: [string, unknown][] = []
+  on('config.set', (_$, e) => (set.push([e.key, e.value]), { value: e.value }))
   on('command.run', () => ({ text: '' }))
   const run = (args: string) =>
     $.command.run({
@@ -33,9 +32,13 @@ test('/task-alert toggles the alert sound and keeps it', async ($, on) => {
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 100 },
     } as Parameters<typeof $.command.run>[0])
-  expect((await run('')).text).toMatch(/끔/)
-  expect((saved.get('prefs') as { hasSound: boolean }).hasSound).toBe(false)
-  expect((await run('')).text).toMatch(/켬/)
   expect((await run('off')).text).toMatch(/끔/)
-  expect((await run('off')).text).toMatch(/끔/)
+  expect(set.at(-1)).toEqual(['work-alerts.sound', false])
+  expect((await run('on')).text).toMatch(/켬/)
+  expect(set.at(-1)).toEqual(['work-alerts.sound', true])
+})
+
+test('options map to prefs, with safe defaults', async () => {
+  expect(prefsFrom({})).toEqual({ isOn: true, hasSound: true, hasDesktop: true, longTurnSec: 60, subagent: '알림 창만' })
+  expect(prefsFrom({ sound: false, longTurn: '2분', subagent: '끄기' })).toMatchObject({ hasSound: false, longTurnSec: 120, subagent: '끄기' })
 })

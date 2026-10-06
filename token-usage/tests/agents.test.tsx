@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { elapsed } from '../hooks/register'
+
 const BAND = {
   component: 'AbovePrompt' as const,
   props: { hasSurvey: false, isWorking: true, maxRows: 30, bodyColumns: 120, scroll: { offset: 0, bodyRows: 30 }, view: {} },
@@ -9,6 +11,7 @@ const BAND = {
 test('a running subagent gets its own row; pressing it opens its transcript', async ($, on) => {
   let isUp = false
   const opened: string[] = []
+  on('agent.list', () => ({ value: ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7'].map(id => ({ id, type: 'Explore', description: `job ${id}`, status: 'running' as const })) }))
   on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
   on('ui.status', () => ({ value: undefined }))
   on('settings.read', () => ({ value: {} }))
@@ -51,6 +54,7 @@ test('a running subagent gets its own row; pressing it opens its transcript', as
 
 test('past five subagents, "더 보기" opens a list where any one can be picked', async ($, on) => {
   let isUp = false
+  on('agent.list', () => ({ value: ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7'].map(id => ({ id, type: 'Explore', description: `job ${id}`, status: 'running' as const })) }))
   on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
   on('ui.status', () => ({ value: undefined }))
   on('settings.read', () => ({ value: {} }))
@@ -87,14 +91,14 @@ test('past five subagents, "더 보기" opens a list where any one can be picked
 test('a viewed subagent that finishes keeps its row and pane, marked done', async ($, on) => {
   let isUp = false
   const toasts: string[] = []
+  on('agent.list', () => ({ value: [{ id: 'a1', type: 'Explore', description: 'job a1', status: 'running' as const }] }))
   on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_$, e) => (toasts.push(e.text), { value: undefined }))
   on('settings.read', () => ({ value: {} }))
   on('command.run', () => ({ text: '' }))
   on('tool.call', () => ({ result: 'ok' }))
-  on('agent.list', () => ({ value: [] }))
-  on('ui.panes', () => ({ value: isUp ? [{ id: 'agent-view', title: '', isShown: true, isFocused: false, isPlaced: true, plugin: 'token-usage' }] : [] }))
+    on('ui.panes', () => ({ value: isUp ? [{ id: 'agent-view', title: '', isShown: true, isFocused: false, isPlaced: true, plugin: 'token-usage' }] : [] }))
   on('ui.open', () => ((isUp = true), { value: { isPlaced: true } }))
   on('ui.close', () => ((isUp = false), { value: undefined }))
   on('session.messages', () => ({ value: [{ role: 'assistant', text: 'final answer', toolUses: [] }] }))
@@ -118,4 +122,64 @@ test('a viewed subagent that finishes keeps its row and pane, marked done', asyn
   expect(await pane.find({ type: 'Text', text: /작업이 끝났습니다/ })).toBeDefined()
   expect(await pane.find({ type: 'Text', text: /final answer/ })).toBeDefined()
   await pane.unmount()
+})
+
+test('ids the roster never lists (engine forks) get no row', async ($, on) => {
+  on('agent.list', () => ({ value: [] }))
+  on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
+  on('ui.status', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: {} }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.py', agentId: 'fork-1' } as Parameters<typeof $.tool.call>[0])
+  const band = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await band.find({ type: 'Text', text: /①/ })).toBeUndefined()
+  await band.unmount()
+})
+
+test('a failed run says so, with its elapsed time; closing the pane clears the view', async ($, on) => {
+  let now = Date.UTC(2026, 9, 6, 10)
+  on('agent.list', () => ({ value: [{ id: 'a1', type: 'Explore', description: 'job a1', status: 'running' as const }] }))
+  on('clock.now', () => ({ value: now }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: {} }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.close', () => ({ value: undefined }))
+  on('session.messages', () => ({ value: [] }))
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.py', agentId: 'a1' } as Parameters<typeof $.tool.call>[0])
+  now += 72_000
+  const band = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await band.find({ type: 'Text', text: /1분 12초/ })).toBeDefined()
+  await band.press({ key: 'agent:a1' })
+  await band.unmount()
+
+  await $.turn.complete({ agentId: 'a1', answer: '', reason: 'error' } as Parameters<typeof $.turn.complete>[0])
+  const after = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await after.find({ type: 'Text', text: /실패/ })).toBeDefined()
+  await after.unmount()
+
+  // Pressing the name again closes the pane, as Esc does.
+  const again = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  await again.press({ key: 'agent:a1' })
+  await again.unmount()
+  const closed = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await closed.find({ type: 'Text', text: /👁/ })).toBeUndefined()
+  expect(await closed.find({ type: 'Text', text: /실패/ })).toBeUndefined()
+  await closed.unmount()
+})
+
+test('elapsed reads in Korean units', () => {
+  expect(elapsed(45_000)).toBe('45초')
+  expect(elapsed(72_000)).toBe('1분 12초')
+  expect(elapsed(3_780_000)).toBe('1시간 3분')
 })

@@ -44,11 +44,16 @@ async function themeCommand($: EngineInterface, words: string[]): Promise<{ text
       })
       .catch(() => '')
     const name = names.find(n => picked.startsWith(n))
-    if (!name) return { text: 'Theme unchanged.' }
+    if (!name) return { text: '테마를 바꾸지 않았습니다.' }
     words = ['theme', name]
   }
   const r = applyThemeArgs(await loadTheme($), words)
-  if (r.next) await $.fs.write(themePath(await $.env.get('HOME'), await $.env.get('CLAUDE_MODS_THEME_FILE')), `${JSON.stringify(r.next, null, 2)}\n`)
+  if (r.next) {
+    const path = themePath(await $.env.get('HOME'), await $.env.get('CLAUDE_MODS_THEME_FILE'))
+    const isSaved = await $.fs.write(path, `${JSON.stringify(r.next, null, 2)}\n`).then(() => true, () => false)
+    // Still applied to this session when the file cannot be written.
+    if (!isSaved) return { text: `${r.text}\n(테마 파일 ${path} 을 저장하지 못해 이번 세션에만 적용됩니다)`, theme: r.next }
+  }
   return { text: r.text, theme: r.next }
 }
 
@@ -68,7 +73,7 @@ async function freshen($: EngineInterface) {
   }))
 }
 
-const themeOf = (u: Usage): Palette => palette((u.theme as ThemeFile | undefined) ?? { preset: 'default', overrides: {} })
+const themeFrom = (u: Usage): Palette => palette((u.theme as ThemeFile | undefined) ?? { preset: 'default', overrides: {} })
 
 // ---------------------------------------------------------------- formatting
 
@@ -183,6 +188,35 @@ const AGENT_ICON: Record<string, { icon: string; tone: Tone }> = {
 }
 
 const isLive = (a: AgentRow) => ['pending', 'running', 'waiting'].includes(a.status)
+// A teammate waiting for a message: still around, not working.
+const isIdle = (a: AgentRow) => a.status === 'idle'
+const u0Live = (u: Usage) => u.agents.some(isLive)
+
+export const STATUS_KO: Record<string, string> = {
+  pending: '대기',
+  running: '실행 중',
+  waiting: '실행 중',
+  idle: '메시지 기다리는 중',
+  completed: '끝남',
+  failed: '실패',
+  killed: '중단됨',
+}
+
+// 1분 12초, 45초, 1시간 3분
+export const elapsed = (ms: number): string => {
+  const sec = Math.max(0, Math.floor(ms / 1000))
+  if (sec < 60) return `${sec}초`
+  const min = Math.floor(sec / 60)
+  if (min < 60) return sec % 60 ? `${min}분 ${sec % 60}초` : `${min}분`
+  return min % 60 ? `${Math.floor(min / 60)}시간 ${min % 60}분` : `${Math.floor(min / 60)}시간`
+}
+
+export const agentElapsed = (a: AgentRow, now: number): string | undefined =>
+  a.startedAt === undefined ? undefined : elapsed((a.endedAt ?? now) - a.startedAt)
+
+// A turn's end reason as the agent's final status.
+export const endStatus = (reason: string): string =>
+  reason === 'aborted' ? 'killed' : reason === 'error' || reason === 'refusal' ? 'failed' : 'completed'
 
 // ---------------------------------------------------------------- state updates
 
@@ -222,12 +256,19 @@ const blankAgent = (id: string): AgentRow => ({
   cacheWrite: 0,
 })
 
-export const upsertAgent = (u: Usage, id: string, change: (a: AgentRow) => AgentRow): Usage => {
+// A new row takes the next seq, so marks never shift. Trimming drops the oldest rows that
+// have ended and are not being viewed; running ones always stay.
+export const upsertAgent = (u: Usage, id: string, change: (a: AgentRow) => AgentRow, now?: number): Usage => {
   const found = u.agents.find(a => a.id === id)
-  const next = change(found ?? blankAgent(id))
+  const seq = u.nextSeq ?? u.agents.length
+  const next = change(found ?? { ...blankAgent(id), seq, startedAt: now })
   const agents = found ? u.agents.map(a => (a.id === id ? next : a)) : [...u.agents, next]
-  return { ...u, agents: agents.slice(-KEEP_AGENTS) }
+  let extra = agents.length - KEEP_AGENTS
+  const kept = agents.filter(a => !(extra > 0 && !isLive(a) && !isIdle(a) && a.id !== u.viewing && extra-- > 0))
+  return { ...u, agents: kept, nextSeq: found ? (u.nextSeq ?? u.agents.length) : seq + 1 }
 }
+
+export const tagOf = (a: AgentRow | undefined, u: Usage) => agentTag(a ? (a.seq ?? u.agents.indexOf(a)) : 0)
 
 export const addAgentRun = (u: Usage, id: string, t: TurnUsage): Usage =>
   upsertAgent(u, id, a => ({ ...add(a, t), model: t.model, runs: a.runs + 1 }))
@@ -261,7 +302,13 @@ const syncAgents = async ($: EngineInterface) => {
     agents: u.agents.map(a => {
       const info = roster.find(r => r.id === a.id)
       return info
-        ? { ...a, type: info.type, description: info.description, status: info.status }
+        ? {
+            ...a,
+            type: info.type,
+            description: info.description,
+            status: info.status,
+            endedAt: ['completed', 'failed', 'killed'].includes(info.status) ? (a.endedAt ?? Date.now()) : a.endedAt,
+          }
         : a
     }),
   }))
@@ -317,40 +364,87 @@ export const transcriptLines = (messages: readonly SessionMessage[], width: numb
 const ctxPercent = (a: AgentRow, u: Usage): number | undefined =>
   a.ctxTokens ? Math.min(100, Math.round((a.ctxTokens / windowFor(a.model, u)) * 100)) : undefined
 
-const isAgentPaneUp = async ($: EngineInterface) =>
-  (await $.ui.panes()).some(p => p.id === AGENT_PANE && p.isPlaced)
+// Engine forks (compaction, memory) and workflow agents carry ids the roster never lists:
+// only ids the roster knows get a row, so no row is left "running" forever.
+const known = new Set<string>()
+const ignored = new Set<string>()
+const isTracked = async ($: EngineInterface, id: string): Promise<boolean> => {
+  if (known.has(id)) return true
+  if (ignored.has(id)) return false
+  const roster = await $.agent.list().catch(() => [])
+  for (const r of roster) known.add(r.id)
+  if (!known.has(id)) ignored.add(id)
+  return known.has(id)
+}
+
+// Redraw once a second while a subagent runs, so its elapsed time counts up.
+let isTicking = false
+const tick = async ($: EngineInterface) => {
+  if (isTicking) return
+  isTicking = true
+  try {
+    while ((await read($, usage)).agents.some(isLive)) {
+      await $.clock.sleep(1000)
+      $.ui.invalidate('ui.render')
+    }
+  } catch {
+    // No clock (a test, a host without timers): the time still updates on each event.
+  } finally {
+    isTicking = false
+  }
+}
 
 // A press on a subagent's row opens its transcript in a pane; pressing the one shown closes it.
 type View = { columns?: number; rows?: number } | undefined
 
 // Opened focused and near full size, so it reads as the main view switching to that agent.
-const toggleAgentView = async ($: EngineInterface, id: string, view: View) => {
+const toggleAgentView = async ($: EngineInterface, id: string, view: View, isTab = false) => {
   const u = await read($, usage)
-  if (u.viewing === id && (await isAgentPaneUp($))) {
+  if (u.viewing === id) {
+    // A tab already shown stays; the row's name toggles the pane shut.
+    if (isTab) return
     await update($, usage, x => ({ ...x, viewing: undefined }))
     await $.ui.close({ id: AGENT_PANE })
     return
   }
   const a = u.agents.find(x => x.id === id)
-  const tag = agentTag(a ? u.agents.indexOf(a) : 0)
+  const tag = tagOf(a, u)
   await update($, usage, x => ({ ...x, viewing: id }))
-  await $.ui.open({
+  const cols = view?.columns ?? 100
+  const placed = await $.ui.open({
     id: AGENT_PANE,
     title: id === AGENT_LIST ? '서브에이전트 목록' : `${tag.mark} ${a?.description || a?.type || '서브에이전트'}`,
     focus: true,
     closeOnEscape: true,
-    rows: Math.max(10, (view?.rows ?? 30) - 8),
-    columns: Math.max(60, (view?.columns ?? 100) - 20),
+    rows: Math.max(6, (view?.rows ?? 30) - 8),
+    columns: Math.max(20, Math.min(cols - 2, cols - 20)),
   })
+  if (!placed.isPlaced) {
+    await update($, usage, x => ({ ...x, viewing: undefined }))
+    $.ui.toast('창을 열 자리가 없습니다. 터미널을 넓히고 다시 눌러 주세요.', { timeoutMs: 5000 })
+  }
 }
 
 // ---------------------------------------------------------------- hooks
 
-export const register: Register = on => {
+type Opts = { isBandOn: boolean; hasResetTimes: boolean; agentRows: number; hasActivity: boolean; theme?: string }
+export const optsFrom = (o: Readonly<Record<string, unknown>>): Opts => ({
+  isBandOn: o.band !== false,
+  hasResetTimes: o.resetTimes === true,
+  agentRows: o.agentRows === '끄기' ? 0 : Number(o.agentRows ?? 5) || 5,
+  hasActivity: o.agentActivity !== false,
+  theme: typeof o.theme === 'string' && o.theme in PRESETS ? o.theme : undefined,
+})
+
+// Settings come from /config (userConfig); a change there reloads the module.
+export const register: Register = (on, options) => {
+  const opts = optsFrom(options)
+  const themeOf = (u: Usage): Palette => (opts.theme ? palette({ preset: opts.theme, overrides: {} }) : themeFrom(u))
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'token-usage',
-      description: 'Fold or unfold token details above the prompt (context, rate limits, models, subagents); theme picks colors',
+      description: '입력창 위 사용량 자세히 펼치기/접기 (컨텍스트, 사용 한도, 모델, 서브에이전트). 설정은 /config',
       argumentHint: '[open|close|band on|off|theme [name]|color <slot> <#hex>]',
     })
     const theme = await loadTheme($)
@@ -372,29 +466,50 @@ export const register: Register = on => {
       return { text: r.text }
     }
     if (arg === 'band off' || arg === 'band on') {
-      await update($, usage, u => ({ ...u, isBandHidden: arg === 'band off' }))
-      return { text: `Token band ${arg === 'band off' ? 'hidden' : 'shown'}.` }
+      const r = await $.config.set({ key: 'token-usage.band', value: arg === 'band on' }).catch(() => ({ deny: 'error' }))
+      if ('deny' in r && r.deny !== undefined) await update($, usage, u => ({ ...u, isBandHidden: arg === 'band off' }))
+      return { text: arg === 'band off' ? '사용량 줄을 숨겼습니다.' : '사용량 줄을 보여줍니다.' }
     }
     if (arg === 'close' || arg === 'open' || arg === '') {
       await freshen($)
       const isExpanded = arg === 'open' || (arg === '' && !(await read($, usage)).isExpanded)
       await update($, usage, u => ({ ...u, isExpanded, isBandHidden: false }))
-      return { text: isExpanded ? 'Token details shown above the prompt. /token-usage again folds them.' : 'Token details folded.' }
+      return { text: isExpanded ? '사용량을 자세히 펼쳤습니다. /token-usage 를 한 번 더 입력하면 접힙니다.' : '사용량 자세히 보기를 접었습니다.' }
     }
-    return { text: 'Usage: /token-usage [open|close|band on|off|theme [name]|color <slot> <#hex>]' }
+    return { text: '사용법: /token-usage (펼치기/접기), /token-usage band on|off, /token-usage theme. 나머지 설정은 /config' }
   })
 
   on('session.measure', async ($, e, next) => {
     await update($, usage, u => {
       return { ...u, context: toContext(e.context), limits: toLimits(e.rateLimits) }
     })
+    if ((await read($, usage)).agents.some(isLive)) await syncAgents($).catch(() => undefined)
     await publish($)
+    return next(e)
+  })
+
+  // The pane closed (Esc, its close mark, or a press): nothing is viewed any more.
+  on('ui.close', async ($, e, next) => {
+    const r = await next(e)
+    if (e.id === AGENT_PANE) await update($, usage, u => ({ ...u, viewing: undefined }))
+    return r
+ }).catch(($, e, next) => next(e))
+
+  // /clear starts over: rows of the old conversation would never finish.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      known.clear()
+      ignored.clear()
+      await update($, usage, u => ({ ...EMPTY, theme: u.theme, limits: u.limits, model: u.model, effort: u.effort }))
+    }
     return next(e)
   })
 
   // Every model request names its model: the live model of main and of each subagent.
   on('turn.step', async function* ($, e, next) {
     const agentId = e.agentId
+    if (agentId !== undefined && !(await isTracked($, agentId).catch(() => false))) return yield* next(e)
+    const now = await $.clock.now()
     await update($, usage, u =>
       agentId === undefined
         ? { ...u, model: e.model, effort: e.effort === undefined ? u.effort : String(e.effort) }
@@ -403,8 +518,9 @@ export const register: Register = on => {
             model: e.model,
             effort: e.effort === undefined ? a.effort : String(e.effort),
             status: isLive(a) || a.runs === 0 ? 'running' : a.status,
-          })),
+          }), now),
     )
+    if (agentId !== undefined) void tick($)
     if (agentId !== undefined && e.index === 0) {
       await syncAgents($)
       await publish($)
@@ -420,35 +536,46 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     const agentId = e.agentId
-    if (agentId !== undefined) {
+    if (agentId !== undefined && (await isTracked($, agentId))) {
       const activity = activityOf(e.tool, e as unknown as Record<string, unknown>)
-      await update($, usage, u => upsertAgent(u, agentId, a => ({ ...a, activity })))
+      const now = await $.clock.now()
+      await update($, usage, u => upsertAgent(u, agentId, a => ({ ...a, activity }), now))
+      void tick($)
     }
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     const t = e.usage
     const agentId = e.agentId
+    if (agentId !== undefined && !(await isTracked($, agentId).catch(() => false))) return done
     if (t) {
       await update($, usage, u =>
         agentId === undefined ? addMainTurn(u, t) : addAgentRun(u, agentId, t),
       )
     }
     if (agentId !== undefined) {
-      await syncAgents($)
+      await syncAgents($).catch(() => undefined)
       // A subagent's turn ending is its run ending, even if the roster has not caught up yet.
-      await update($, usage, u => upsertAgent(u, agentId, a => (isLive(a) ? { ...a, status: 'completed' } : a)))
+      // A teammate goes idle instead, and the roster says so.
+      const now = await $.clock.now()
+      const status = endStatus(e.reason)
+      await update($, usage, u =>
+        upsertAgent(u, agentId, a => (isLive(a) ? { ...a, status, endedAt: a.endedAt ?? now } : a)),
+      )
       const u = await read($, usage)
       const a = u.agents.find(x => x.id === agentId)
-      if (a && u.viewing === agentId && (await isAgentPaneUp($))) {
-        const tag = agentTag(u.agents.indexOf(a))
-        $.ui.toast(`${tag.mark} ${a.description || a.type} ${a.status === 'completed' ? '끝남' : '멈춤'}: 결과는 열린 창에 남아 있습니다`, { timeoutMs: 6000 })
+      if (a && u.viewing === agentId) {
+        const tag = tagOf(a, u)
+        const how = a.status === 'completed' ? '끝남' : a.status === 'idle' ? '메시지 기다리는 중' : `멈춤 (${STATUS_KO[a.status] ?? a.status})`
+        $.ui.toast(`${tag.mark} ${a.description || a.type} ${how}: 결과는 열린 창에 남아 있습니다`, { timeoutMs: 6000 })
       }
     } else {
       const theme = await loadTheme($)
       await update($, usage, u => ({ ...u, theme }))
+      // A subagent stopped without its own turn.complete is caught here.
+      if (u0Live(await read($, usage))) await syncAgents($).catch(() => undefined)
     }
     await publish($)
     return done
@@ -459,7 +586,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
     const below = await next(e)
-    if (e.props.hasSurvey || u.isBandHidden) return below
+    if (e.props.hasSurvey || u.isBandHidden || (!opts.isBandOn && !u.isExpanded)) return below
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const P = themeOf(u)
@@ -468,7 +595,8 @@ export const register: Register = on => {
     const pct = u.context?.percent
     const st = pct !== undefined ? contextState(pct) : null
     const limits = u.limits ?? []
-    const live = u.agents.filter(isLive)
+    const live = u.agents.filter(a => isLive(a) || isIdle(a))
+    const isNarrow = cols < 80
     const sep = <Text dimColor> │ </Text>
     const short = (kind: string) => (kind === 'five_hour' ? '5h' : kind === 'seven_day' ? '7d' : limitLabel(kind))
     const effortText = (x?: string) => (x ? <Text dimColor> {x}</Text> : null)
@@ -496,6 +624,7 @@ export const register: Register = on => {
                 <Text bold color={P[contextState(l.percentUsed).tone]}>
                   {Math.round(l.percentUsed)}%
                 </Text>
+                {opts.hasResetTimes && <Text dimColor> {resetsIn(l.resetsAt, now)}</Text>}
               </Text>
             ))}
           </Text>
@@ -514,15 +643,16 @@ export const register: Register = on => {
     )
 
     // One row per running subagent, so each model sits next to its own job.
-    const MAX_AGENT_ROWS = 5
-    const viewing = u.viewing !== undefined && (await isAgentPaneUp($)) ? u.viewing : undefined
-    const nameWidth = 24
+    const MAX_AGENT_ROWS = opts.agentRows
+    const viewing = u.viewing
+    const nameWidth = isNarrow ? 14 : 24
     const agentRows = [
       // The agent being viewed keeps its row after it finishes, until its pane is closed.
       ...[...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !isLive(x))].map(a => {
-        const tag = agentTag(u.agents.indexOf(a))
+        const tag = tagOf(a, u)
         const cp = ctxPercent(a, u)
         const isViewing = a.id === viewing
+        const took = agentElapsed(a, now)
         return (
           <Box key={`agent:${a.id}`}>
             <Text color={P.accent}>{isViewing ? '👁 ' : '  '}</Text>
@@ -536,16 +666,23 @@ export const register: Register = on => {
             <Text> </Text>
             <Text bold>{a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}</Text>
             {effortText(a.effort)}
-            {!isLive(a) && <Text color={P.ok}> ✓ 끝남</Text>}
+            {!isLive(a) && (
+              <Text color={a.status === 'completed' ? P.ok : isIdle(a) ? P.cache : P.danger}>
+                {' '}
+                {a.status === 'completed' ? '✓' : isIdle(a) ? '◌' : '✗'} {STATUS_KO[a.status] ?? a.status}
+              </Text>
+            )}
+            {took && <Text dimColor> │ ⏱ {took}</Text>}
             <Text dimColor> │ ctx </Text>
             {cp !== undefined ? (
               <Text color={P[contextState(cp).tone]}>
-                {fineBar(cp, 6)} {cp}%
+                {isNarrow ? '' : `${fineBar(cp, 6)} `}
+                {cp}%
               </Text>
             ) : (
               <Text dimColor>-</Text>
             )}
-            {a.activity && <Text dimColor> │ {clip(a.activity, Math.max(10, cols - nameWidth - 50))}</Text>}
+            {opts.hasActivity && !isNarrow && a.activity && <Text dimColor> │ {clip(a.activity, Math.max(10, cols - nameWidth - 62))}</Text>}
           </Box>
         )
       }),
@@ -620,7 +757,7 @@ export const register: Register = on => {
             <Text>
               <Text>{'  '}</Text>
               <Text color={P[as.tone]}>{as.icon} </Text>
-              <Text bold color={P[agentTag(u.agents.indexOf(a)).tone]}>{fit(`${agentTag(u.agents.indexOf(a)).mark} ${clip(a.description || a.type, 16)}`, 20)}</Text>
+              <Text bold color={P[tagOf(a, u).tone]}>{fit(`${tagOf(a, u).mark} ${clip(a.description || a.type, 16)}`, 20)}</Text>
               <Text color={P.warn}>{modelCell(a.model, a.effort)}</Text>
               {cp !== undefined ? (
                 <Text>
@@ -655,19 +792,20 @@ export const register: Register = on => {
     const width = Math.max(20, (e.props.bodyColumns ?? e.viewport?.columns ?? 60) - 2)
     const view = e.viewport
     // Running first, then the latest finished: every subagent stays one press away.
+    const nowMs = await $.clock.now()
     const ordered = [...u.agents.filter(isLive), ...u.agents.filter(x => !isLive(x)).reverse()]
     const tabs = (
       <Box key="tabs" flexWrap="wrap">
-        <Button key="tab:*" plain label={u.viewing === AGENT_LIST ? '[목록]' : ' 목록 '} onPress={() => toggleAgentView($, AGENT_LIST, view)} />
+        <Button key="tab:*" plain label={u.viewing === AGENT_LIST ? '[목록]' : ' 목록 '} onPress={() => toggleAgentView($, AGENT_LIST, view, true)} />
         {ordered.slice(0, 12).map(x => {
-          const t = agentTag(u.agents.indexOf(x))
+          const t = tagOf(x, u)
           const isOn = x.id === u.viewing
           return (
             <Button
               key={`tab:${x.id}`}
               plain
               label={`${isOn ? '[' : ' '}${t.mark}${isLive(x) ? '' : '✓'} ${clip(x.description || x.type, 10)}${isOn ? ']' : ' '}`}
-              onPress={() => toggleAgentView($, x.id, view)}
+              onPress={() => toggleAgentView($, x.id, view, true)}
             />
           )
         })}
@@ -680,15 +818,16 @@ export const register: Register = on => {
           <Text dimColor>{'─'.repeat(Math.min(width, 80))}</Text>
           {ordered.length === 0 && <Text dimColor>아직 서브에이전트가 없습니다.</Text>}
           {ordered.map(x => {
-            const t = agentTag(u.agents.indexOf(x))
+            const t = tagOf(x, u)
             const xp = ctxPercent(x, u)
             return (
               <Box key={`row:${x.id}`}>
                 <Text bold color={P[t.tone]}>{t.mark} </Text>
-                <Button key={`pick:${x.id}`} plain label={fit(clip(x.description || x.type, 24), 24)} onPress={() => toggleAgentView($, x.id, view)} />
+                <Button key={`pick:${x.id}`} plain label={fit(clip(x.description || x.type, 24), 24)} onPress={() => toggleAgentView($, x.id, view, true)} />
                 <Text bold> {x.model ? modelName(x.model).replace(/ 1M$/, '') : '?'}</Text>
                 {x.effort && <Text dimColor> {x.effort}</Text>}
-                <Text color={isLive(x) ? P.warn : P.ok}> {isLive(x) ? '실행 중' : '끝남'}</Text>
+                <Text color={isLive(x) ? P.warn : x.status === 'completed' ? P.ok : isIdle(x) ? P.cache : P.danger}> {STATUS_KO[x.status] ?? x.status}</Text>
+                {agentElapsed(x, nowMs) && <Text dimColor> · ⏱ {agentElapsed(x, nowMs)}</Text>}
                 <Text dimColor> · ctx {xp !== undefined ? `${xp}%` : '-'}</Text>
                 {x.activity && <Text dimColor> · {clip(x.activity, Math.max(10, width - 70))}</Text>}
               </Box>
@@ -699,12 +838,13 @@ export const register: Register = on => {
     }
     const a = u.agents.find(x => x.id === u.viewing)
     if (!a) return <Box flexDirection="column">{tabs}<Text dimColor>위 줄에서 서브에이전트 이름을 누르면 여기에 그 작업 내용이 나옵니다.</Text></Box>
-    const tag = agentTag(u.agents.indexOf(a))
+    const tag = tagOf(a, u)
     const cp = ctxPercent(a, u)
-    const found = await $.session.messages({ agentId: a.id })
+    const found = await $.session.messages({ agentId: a.id }).catch(() => ({ deny: 'error' }) as const)
     const lines = transcriptLines('deny' in found ? [] : found, width)
     const room = Math.max(3, (e.viewport?.rows ?? 24) - 6)
-    const STATUS: Record<string, string> = { running: '실행 중', pending: '대기', waiting: '기다리는 중', completed: '끝남', failed: '실패', killed: '중단' }
+    const STATUS = STATUS_KO
+    const took = agentElapsed(a, await $.clock.now())
     const isLiveNow = isLive(a)
     return (
       <Box flexDirection="column">
@@ -716,6 +856,7 @@ export const register: Register = on => {
           <Text bold> {a.model ? modelName(a.model) : '?'}</Text>
           {a.effort && <Text dimColor> {a.effort}</Text>}
           <Text color={isLiveNow ? P.warn : P.ok}> · {STATUS[a.status] ?? a.status}</Text>
+          {took && <Text dimColor> · ⏱ {took}</Text>}
           <Text dimColor> · ctx {cp !== undefined ? `${cp}%` : '-'} · Esc: 메인으로</Text>
         </Text>
         {'deny' in found && <Text dimColor>이 서브에이전트의 기록을 읽을 수 없습니다.</Text>}
@@ -741,7 +882,7 @@ export const register: Register = on => {
           <Text color={P.warn}>✻ 작업 중…</Text>
         ) : (
           <Text color={a.status === 'completed' ? P.ok : P.danger}>
-            {a.status === 'completed' ? '✓ 작업이 끝났습니다.' : `✗ 작업이 멈췄습니다 (${STATUS[a.status] ?? a.status}).`} 다른 서브에이전트는 위 탭에서, Esc는 메인으로.
+            {a.status === 'completed' ? `✓ 작업이 끝났습니다${took ? ` (${took} 걸림)` : ''}.` : isIdle(a) ? '◌ 메시지를 기다리는 중입니다.' : `✗ 작업이 멈췄습니다 (${STATUS[a.status] ?? a.status}).`} 다른 서브에이전트는 위 탭에서, Esc는 메인으로.
           </Text>
         )}
       </Box>
