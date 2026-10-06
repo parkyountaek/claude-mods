@@ -4,7 +4,7 @@ Claude Code mods (plugins built from function hooks).
 
 | mod | 하는 일 | 명령 |
 | --- | --- | --- |
-| `token-usage` | 입력창 위 한 줄에 컨텍스트 사용량, 5시간·7일 사용 한도, 메인 모델과 effort를 보여줍니다. 실행 중인 서브에이전트는 ①②③ 번호와 색으로 구분해 한 줄씩 보여줍니다. | `/token-usage` 펼치기/접기, `/token-usage theme` |
+| `token-usage` | 입력창 위 한 줄에 컨텍스트 사용량, 5시간·7일 사용 한도, 메인 모델과 effort를 보여줍니다. 실행 중인 서브에이전트는 ①②③ 번호와 색으로 구분해 한 줄씩, 모델·ctx·지금 보는 파일과 함께 보여줍니다. 이름을 누르면 그 서브에이전트의 작업 내용이 옆 창에 열립니다(👁 표시). | `/token-usage` 펼치기/접기, `/token-usage theme` |
 | `work-alerts` | 오래 걸린 작업이 끝났을 때, 테스트·검사가 실패했을 때, 한도가 찼을 때 알림 창과 소리로 알려줍니다. | `/task-alert` 소리 켜기/끄기, `/alerts` 세부 설정 |
 | `compact-handoff` | 할 일이 있을 때 진행 상황(▶ 2/5 …)을 보여주고, 대화가 압축되어도 작업을 이어가도록 메모를 남깁니다. | `/work`, `/handoff` |
 

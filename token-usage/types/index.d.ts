@@ -17,6 +17,8 @@ export type AgentRow = Tokens & {
   effort?: string
   // Input of its latest request: how full its own context window is.
   ctxTokens?: number
+  // Its latest tool call, as "Read docs/spec.md": what it is looking at now.
+  activity?: string
 }
 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
@@ -38,6 +40,8 @@ export type Usage = {
   theme?: { preset: string; overrides: Record<string, string> }
   // The band above the prompt drawn in detail (toggled by /token-usage).
   isExpanded?: boolean
+  // The subagent whose transcript the agent pane shows.
+  viewing?: string
 }
 
 declare module 'claude-code' {

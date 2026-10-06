@@ -267,6 +267,38 @@ const syncAgents = async ($: EngineInterface) => {
   }))
 }
 
+const AGENT_PANE = 'agent-view'
+
+// What a tool call looks at, in a few words: "Read stockbot/cli.py", "Bash grep -n add_parser".
+export const activityOf = (tool: string, input: Record<string, unknown>): string => {
+  const key = ['file_path', 'path', 'pattern', 'command', 'url', 'query', 'description', 'prompt'].find(
+    k => typeof input[k] === 'string' && input[k] !== '',
+  )
+  const arg = key ? String(input[key]).split('\n')[0] ?? '' : ''
+  const short = key === 'file_path' || key === 'path' ? arg.split('/').slice(-2).join('/') : arg
+  return clip(`${tool} ${short}`.trim(), 60)
+}
+
+const ctxPercent = (a: AgentRow, u: Usage): number | undefined =>
+  a.ctxTokens ? Math.min(100, Math.round((a.ctxTokens / windowFor(a.model, u)) * 100)) : undefined
+
+const isAgentPaneUp = async ($: EngineInterface) =>
+  (await $.ui.panes()).some(p => p.id === AGENT_PANE && p.isPlaced)
+
+// A press on a subagent's row opens its transcript in a pane; pressing the one shown closes it.
+const toggleAgentView = async ($: EngineInterface, id: string) => {
+  const u = await read($, usage)
+  if (u.viewing === id && (await isAgentPaneUp($))) {
+    await update($, usage, x => ({ ...x, viewing: undefined }))
+    await $.ui.close({ id: AGENT_PANE })
+    return
+  }
+  const a = u.agents.find(x => x.id === id)
+  const tag = agentTag(a ? u.agents.indexOf(a) : 0)
+  await update($, usage, x => ({ ...x, viewing: id }))
+  await $.ui.open({ id: AGENT_PANE, title: `${tag.mark} ${a?.description || a?.type || '서브에이전트'}`, closeOnEscape: true })
+}
+
 // ---------------------------------------------------------------- hooks
 
 export const register: Register = on => {
@@ -341,6 +373,15 @@ export const register: Register = on => {
     return r
   })
 
+  on('tool.call', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId !== undefined) {
+      const activity = activityOf(e.tool, e as unknown as Record<string, unknown>)
+      await update($, usage, u => upsertAgent(u, agentId, a => ({ ...a, activity })))
+    }
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     const t = e.usage
@@ -366,7 +407,7 @@ export const register: Register = on => {
     const below = await next(e)
     if (e.props.hasSurvey || u.isBandHidden) return below
 
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const P = themeOf(u)
     const cols = e.viewport?.columns ?? 80
     const now = await $.clock.now()
@@ -420,19 +461,38 @@ export const register: Register = on => {
 
     // One row per running subagent, so each model sits next to its own job.
     const MAX_AGENT_ROWS = 5
+    const viewing = u.viewing !== undefined && (await isAgentPaneUp($)) ? u.viewing : undefined
+    const nameWidth = 24
     const agentRows = [
-      ...live.slice(0, MAX_AGENT_ROWS).map(a => (
-        <Text>
-          <Text>  </Text>
-          <Text bold color={P[agentTag(u.agents.indexOf(a)).tone]}>
-            {agentTag(u.agents.indexOf(a)).mark} {fit(clip(a.description || a.type, 28), 30)}
-          </Text>
-          <Text bold>
-            {a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}
-          </Text>
-          {effortText(a.effort)}
-        </Text>
-      )),
+      ...live.slice(0, MAX_AGENT_ROWS).map(a => {
+        const tag = agentTag(u.agents.indexOf(a))
+        const cp = ctxPercent(a, u)
+        const isViewing = a.id === viewing
+        return (
+          <Box key={`agent:${a.id}`}>
+            <Text color={P.accent}>{isViewing ? '👁 ' : '  '}</Text>
+            <Text bold color={P[tag.tone]}>{tag.mark} </Text>
+            <Button
+              key={`agent:${a.id}`}
+              plain
+              label={fit(clip(a.description || a.type, nameWidth), nameWidth)}
+              onPress={() => toggleAgentView($, a.id)}
+            />
+            <Text> </Text>
+            <Text bold>{a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}</Text>
+            {effortText(a.effort)}
+            <Text dimColor> │ ctx </Text>
+            {cp !== undefined ? (
+              <Text color={P[contextState(cp).tone]}>
+                {fineBar(cp, 6)} {cp}%
+              </Text>
+            ) : (
+              <Text dimColor>-</Text>
+            )}
+            {a.activity && <Text dimColor> │ {clip(a.activity, Math.max(10, cols - nameWidth - 50))}</Text>}
+          </Box>
+        )
+      }),
       ...(live.length > MAX_AGENT_ROWS ? [<Text dimColor>  🤖 외 {live.length - MAX_AGENT_ROWS}개 (/token-usage)</Text>] : []),
     ]
 
@@ -516,4 +576,46 @@ export const register: Register = on => {
     )
   })
 
+
+  // ------------------------------------------------------------ agent pane
+
+  on('ui.render', { component: 'Pane', requestId: AGENT_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const u = await read($, usage)
+    const P = themeOf(u)
+    const a = u.agents.find(x => x.id === u.viewing)
+    if (!a) return <Text dimColor>위 줄에서 서브에이전트 이름을 누르면 여기에 그 작업 내용이 나옵니다.</Text>
+    const tag = agentTag(u.agents.indexOf(a))
+    const cp = ctxPercent(a, u)
+    const found = await $.session.messages({ agentId: a.id })
+    const width = Math.max(20, (e.viewport?.columns ?? 60) - 4)
+    const lines: { kind: 'ask' | 'say' | 'tool'; text: string }[] = []
+    for (const m of 'deny' in found ? [] : found) {
+      const text = m.text.trim()
+      if (text) for (const l of text.split('\n').filter(Boolean).slice(0, 3)) lines.push({ kind: m.role === 'user' ? 'ask' : 'say', text: l })
+      for (const t of m.toolUses) lines.push({ kind: 'tool', text: activityOf(t.tool, t.input) })
+    }
+    const room = Math.max(3, (e.viewport?.rows ?? 24) - 5)
+    const STATUS: Record<string, string> = { running: '실행 중', pending: '대기', waiting: '기다리는 중', completed: '끝남', failed: '실패', killed: '중단' }
+    return (
+      <Box flexDirection="column">
+        <Text>
+          <Text bold color={P[tag.tone]}>{tag.mark} {a.description || a.type}</Text>
+          <Text dimColor> · </Text>
+          <Text bold>{a.model ? modelName(a.model) : '?'}</Text>
+          {a.effort && <Text dimColor> {a.effort}</Text>}
+          <Text dimColor> · {STATUS[a.status] ?? a.status} · ctx {cp !== undefined ? `${cp}%` : '-'}</Text>
+        </Text>
+        <Text dimColor>{'─'.repeat(Math.min(width, 60))}</Text>
+        {'deny' in found && <Text dimColor>이 서브에이전트의 기록을 읽을 수 없습니다.</Text>}
+        {lines.slice(-room).map(l => (
+          <Text dimColor={l.kind === 'ask'} color={l.kind === 'tool' ? P.cache : undefined}>
+            {l.kind === 'tool' ? '🔧 ' : l.kind === 'ask' ? '📝 ' : '💬 '}
+            {clip(l.text, width - 3)}
+          </Text>
+        ))}
+        <Text dimColor>이름을 다시 누르거나 Esc로 닫기</Text>
+      </Box>
+    )
+  })
 }
