@@ -83,3 +83,39 @@ test('past five subagents, "더 보기" opens a list where any one can be picked
   expect(await one.find({ type: 'Text', text: /seventh at work/ })).toBeDefined()
   await one.unmount()
 })
+
+test('a viewed subagent that finishes keeps its row and pane, marked done', async ($, on) => {
+  let isUp = false
+  const toasts: string[] = []
+  on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => (toasts.push(e.text), { value: undefined }))
+  on('settings.read', () => ({ value: {} }))
+  on('command.run', () => ({ text: '' }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('agent.list', () => ({ value: [] }))
+  on('ui.panes', () => ({ value: isUp ? [{ id: 'agent-view', title: '', isShown: true, isFocused: false, isPlaced: true, plugin: 'token-usage' }] : [] }))
+  on('ui.open', () => ((isUp = true), { value: { isPlaced: true } }))
+  on('ui.close', () => ((isUp = false), { value: undefined }))
+  on('session.messages', () => ({ value: [{ role: 'assistant', text: 'final answer', toolUses: [] }] }))
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.py', agentId: 'a1' } as Parameters<typeof $.tool.call>[0])
+  const band = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  await band.press({ key: 'agent:a1' })
+  await band.unmount()
+
+  await $.turn.complete({ agentId: 'a1', answer: 'final answer' } as Parameters<typeof $.turn.complete>[0])
+  expect(toasts.some(t => /끝남/.test(t))).toBe(true)
+
+  const after = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await after.find({ type: 'Text', text: /✓ 끝남/ })).toBeDefined()
+  await after.unmount()
+  const pane = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', component: 'Pane', requestId: 'agent-view', props: { bodyColumns: 100 }, viewport: { columns: 100, rows: 30 } } as Parameters<typeof $.ui.mount>[0])
+  expect(await pane.find({ type: 'Text', text: /작업이 끝났습니다/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /final answer/ })).toBeDefined()
+  await pane.unmount()
+})

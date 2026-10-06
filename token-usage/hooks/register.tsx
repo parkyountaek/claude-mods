@@ -436,8 +436,17 @@ export const register: Register = on => {
         agentId === undefined ? addMainTurn(u, t) : addAgentRun(u, agentId, t),
       )
     }
-    if (agentId !== undefined) await syncAgents($)
-    else {
+    if (agentId !== undefined) {
+      await syncAgents($)
+      // A subagent's turn ending is its run ending, even if the roster has not caught up yet.
+      await update($, usage, u => upsertAgent(u, agentId, a => (isLive(a) ? { ...a, status: 'completed' } : a)))
+      const u = await read($, usage)
+      const a = u.agents.find(x => x.id === agentId)
+      if (a && u.viewing === agentId && (await isAgentPaneUp($))) {
+        const tag = agentTag(u.agents.indexOf(a))
+        $.ui.toast(`${tag.mark} ${a.description || a.type} ${a.status === 'completed' ? '끝남' : '멈춤'}: 결과는 열린 창에 남아 있습니다`, { timeoutMs: 6000 })
+      }
+    } else {
       const theme = await loadTheme($)
       await update($, usage, u => ({ ...u, theme }))
     }
@@ -509,7 +518,8 @@ export const register: Register = on => {
     const viewing = u.viewing !== undefined && (await isAgentPaneUp($)) ? u.viewing : undefined
     const nameWidth = 24
     const agentRows = [
-      ...live.slice(0, MAX_AGENT_ROWS).map(a => {
+      // The agent being viewed keeps its row after it finishes, until its pane is closed.
+      ...[...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !isLive(x))].map(a => {
         const tag = agentTag(u.agents.indexOf(a))
         const cp = ctxPercent(a, u)
         const isViewing = a.id === viewing
@@ -526,6 +536,7 @@ export const register: Register = on => {
             <Text> </Text>
             <Text bold>{a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}</Text>
             {effortText(a.effort)}
+            {!isLive(a) && <Text color={P.ok}> ✓ 끝남</Text>}
             <Text dimColor> │ ctx </Text>
             {cp !== undefined ? (
               <Text color={P[contextState(cp).tone]}>
@@ -726,7 +737,13 @@ export const register: Register = on => {
             <Text>{l.text}</Text>
           ),
         )}
-        {isLiveNow && <Text color={P.warn}>✻ 작업 중…</Text>}
+        {isLiveNow ? (
+          <Text color={P.warn}>✻ 작업 중…</Text>
+        ) : (
+          <Text color={a.status === 'completed' ? P.ok : P.danger}>
+            {a.status === 'completed' ? '✓ 작업이 끝났습니다.' : `✗ 작업이 멈췄습니다 (${STATUS[a.status] ?? a.status}).`} 다른 서브에이전트는 위 탭에서, Esc는 메인으로.
+          </Text>
+        )}
       </Box>
     )
   })
