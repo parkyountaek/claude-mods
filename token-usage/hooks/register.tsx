@@ -3,6 +3,7 @@ import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit, 
 
 import type { AgentRow, Context, Limit, Tokens, Usage } from '../types'
 
+import type { Slot } from './theme'
 import { applyThemeArgs, palette, parseTheme, PRESETS, SLOTS, themePath } from './theme'
 import type { Palette, ThemeFile } from './theme'
 
@@ -161,6 +162,15 @@ export const agentModels = (agents: readonly AgentRow[]): [string, number, strin
 }
 
 type Tone = 'ok' | 'warn' | 'danger' | 'cache'
+
+// Each subagent keeps one number and color for the whole session (its order of first appearance),
+// so its row above the prompt and its row in /token-usage are easy to match.
+const CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+const AGENT_TONES: readonly Slot[] = ['accent', 'warn', 'ok', 'input', 'output', 'cache']
+export const agentTag = (index: number): { mark: string; tone: Slot } => ({
+  mark: CIRCLED[index] ?? `(${index + 1})`,
+  tone: AGENT_TONES[index % AGENT_TONES.length] ?? 'accent',
+})
 
 const AGENT_ICON: Record<string, { icon: string; tone: Tone }> = {
   pending: { icon: '○', tone: 'cache' },
@@ -413,8 +423,11 @@ export const register: Register = on => {
     const agentRows = [
       ...live.slice(0, MAX_AGENT_ROWS).map(a => (
         <Text>
-          <Text dimColor>  🤖 {fit(clip(a.description || a.type, 28), 30)}</Text>
-          <Text bold color={P.warn}>
+          <Text>  </Text>
+          <Text bold color={P[agentTag(u.agents.indexOf(a)).tone]}>
+            {agentTag(u.agents.indexOf(a)).mark} {fit(clip(a.description || a.type, 28), 30)}
+          </Text>
+          <Text bold>
             {a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}
           </Text>
           {effortText(a.effort)}
@@ -479,7 +492,7 @@ export const register: Register = on => {
             <Text>
               <Text>{'  '}</Text>
               <Text color={P[as.tone]}>{as.icon} </Text>
-              <Text bold>{fit(`🤖 ${clip(a.description || a.type, 16)}`, 20)}</Text>
+              <Text bold color={P[agentTag(u.agents.indexOf(a)).tone]}>{fit(`${agentTag(u.agents.indexOf(a)).mark} ${clip(a.description || a.type, 16)}`, 20)}</Text>
               <Text color={P.warn}>{modelCell(a.model, a.effort)}</Text>
               {cp !== undefined ? (
                 <Text>

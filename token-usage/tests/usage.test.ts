@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  agentTag,
   addAgentRun,
   addMainTurn,
   agentModels,
@@ -105,4 +106,11 @@ test('subagent windows and model chips', async () => {
   u = addAgentRun(u, 'b', turn('claude-haiku-4-5'))
   u = { ...u, agents: u.agents.map(a => ({ ...a, status: 'running' })) }
   expect(agentModels(u.agents)).toEqual([['Haiku 4.5', 2, undefined]])
+})
+
+test('subagents get distinct numbers and colors', () => {
+  expect(agentTag(0).mark).toBe('①')
+  expect(agentTag(1).mark).toBe('②')
+  expect(agentTag(0).tone).not.toBe(agentTag(1).tone)
+  expect(agentTag(20).mark).toBe('(21)')
 })
