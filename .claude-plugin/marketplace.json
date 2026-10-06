@@ -1,0 +1,9 @@
+{
+  "name": "pyt-mods",
+  "owner": { "name": "parkyountaek" },
+  "plugins": [
+    { "name": "token-usage", "source": "./token-usage", "description": "입력창 위 한 줄: 컨텍스트 사용량, 사용 한도, 메인·서브에이전트 모델과 effort" },
+    { "name": "work-alerts", "source": "./work-alerts", "description": "긴 작업 완료, 검사 실패, 한도 경고를 알림·소리로 알려줌 (/task-alert로 소리 켜기/끄기)" },
+    { "name": "compact-handoff", "source": "./compact-handoff", "description": "할 일 진행 상황 표시와, 대화 압축 뒤에도 작업을 이어가는 메모 (/work)" }
+  ]
+}

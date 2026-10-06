@@ -1,0 +1,5 @@
+{
+  "name": "work-alerts",
+  "version": "0.1.0",
+  "description": "Toasts, sounds and macOS notifications for long turns, failed checks, finished subagents, context and rate-limit thresholds"
+}

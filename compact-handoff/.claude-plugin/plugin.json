@@ -1,0 +1,6 @@
+{
+  "name": "compact-handoff",
+  "version": "0.1.0",
+  "description": "Work summary pane and band (/work), plus a handoff note pinned across compaction so the task carries on",
+  "types": "./types/index.d.ts"
+}

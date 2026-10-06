@@ -1,0 +1,6 @@
+{
+  "name": "token-usage",
+  "version": "0.1.0",
+  "description": "Context window fill and input/output tokens: band above the prompt, status entry, and a /token-usage pane",
+  "types": "./types/index.d.ts"
+}
