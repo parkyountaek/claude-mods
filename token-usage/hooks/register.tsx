@@ -628,6 +628,9 @@ export const register: Register = (on, options) => {
     const sep = <Text dimColor> │ </Text>
     const short = (kind: string) => (kind === 'five_hour' ? '5h' : kind === 'seven_day' ? '7d' : limitLabel(kind))
     const effortText = (x?: string) => (x ? <Text dimColor> {x}</Text> : null)
+    // A subagent's request often carries no effort; say so rather than leave a gap.
+    const agentEffort = (a: AgentRow) =>
+      a.effort ? <Text color={P.accent}> effort {a.effort}</Text> : a.model ? <Text dimColor> effort 없음</Text> : null
 
     const line = (
       <Text>
@@ -694,7 +697,7 @@ export const register: Register = (on, options) => {
             />
             <Text> </Text>
             <Text bold>{a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}</Text>
-            {effortText(a.effort)}
+            {agentEffort(a)}
             {!isLive(a) && (
               <Text color={a.status === 'completed' ? P.ok : isIdle(a) ? P.cache : P.danger}>
                 {' '}
@@ -754,7 +757,7 @@ export const register: Register = (on, options) => {
       </Text>
     )
     const agentsShown = [...live, ...u.agents.filter(a => !isLive(a)).reverse()].slice(0, 6)
-    const modelCell = (model: string, effort?: string) => fit(`${model ? modelName(model) : '?'}${effort ? ` ${effort}` : ''}`, 20)
+    const modelCell = (model: string, effort?: string) => fit(`${model ? modelName(model) : '?'} ${effort ?? '(effort 없음)'}`, 30)
 
     return (
       <Box flexDirection="column">
@@ -855,7 +858,7 @@ export const register: Register = (on, options) => {
                 <Text bold color={P[t.tone]}>{t.mark} </Text>
                 <Button key={`pick:${x.id}`} plain label={fit(clip(x.description || x.type, 24), 24)} onPress={() => toggleAgentView($, x.id, view, true)} />
                 <Text bold> {x.model ? modelName(x.model).replace(/ 1M$/, '') : '?'}</Text>
-                {x.effort && <Text dimColor> {x.effort}</Text>}
+                <Text dimColor> effort {x.effort ?? '없음'}</Text>
                 <Text color={isLive(x) ? P.warn : x.status === 'completed' ? P.ok : isIdle(x) ? P.cache : P.danger}> {STATUS_KO[x.status] ?? x.status}</Text>
                 {agentElapsed(x, nowMs) && <Text dimColor> · ⏱ {agentElapsed(x, nowMs)}</Text>}
                 <Text dimColor> · ctx {xp !== undefined ? `${xp}%` : '-'}</Text>
@@ -884,7 +887,7 @@ export const register: Register = (on, options) => {
             {` ${tag.mark} ${a.description || a.type} `}
           </Text>
           <Text bold> {a.model ? modelName(a.model) : '?'}</Text>
-          {a.effort && <Text dimColor> {a.effort}</Text>}
+          <Text dimColor> · effort {a.effort ?? '없음'}</Text>
           <Text color={isLiveNow ? P.warn : P.ok}> · {STATUS[a.status] ?? a.status}</Text>
           {took && <Text dimColor> · ⏱ {took}</Text>}
           <Text dimColor> · ctx {cp !== undefined ? `${cp}%` : '-'} · Esc: 메인으로</Text>
