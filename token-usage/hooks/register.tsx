@@ -405,36 +405,29 @@ export const register: Register = on => {
             {effortText(u.effort)}
           </Text>
         )}
-        {/* Up to 3 running subagents are named one by one, so each model is tied to its job. */}
-        {live.length <= 3
-          ? live.map(a => (
-              <Text>
-                {sep}
-                <Text dimColor>🤖 {clip(a.description || a.type, 14)} </Text>
-                <Text bold color={P.warn}>
-                  {a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}
-                </Text>
-                {effortText(a.effort)}
-              </Text>
-            ))
-          : agentModels(live).map(([name, n, effort]) => (
-              <Text>
-                {sep}
-                <Text dimColor>🤖 </Text>
-                <Text bold color={P.warn}>
-                  {name}
-                </Text>
-                {effortText(effort)}
-                {n > 1 && <Text bold> ×{n}</Text>}
-              </Text>
-            ))}
       </Text>
     )
+
+    // One row per running subagent, so each model sits next to its own job.
+    const MAX_AGENT_ROWS = 5
+    const agentRows = [
+      ...live.slice(0, MAX_AGENT_ROWS).map(a => (
+        <Text>
+          <Text dimColor>  🤖 {fit(clip(a.description || a.type, 28), 30)}</Text>
+          <Text bold color={P.warn}>
+            {a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}
+          </Text>
+          {effortText(a.effort)}
+        </Text>
+      )),
+      ...(live.length > MAX_AGENT_ROWS ? [<Text dimColor>  🤖 외 {live.length - MAX_AGENT_ROWS}개 (/token-usage)</Text>] : []),
+    ]
 
     if (!u.isExpanded) {
       return (
         <Box flexDirection="column">
           {line}
+          {agentRows}
           {below}
         </Box>
       )
