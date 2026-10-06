@@ -183,3 +183,43 @@ test('elapsed reads in Korean units', () => {
   expect(elapsed(72_000)).toBe('1분 12초')
   expect(elapsed(3_780_000)).toBe('1시간 3분')
 })
+
+test('a subagent the roster lists a moment late still gets its row', async ($, on) => {
+  let now = Date.UTC(2026, 9, 6, 10)
+  let isListed = false
+  on('agent.list', () => ({ value: isListed ? [{ id: 'a1', type: 'Explore', description: 'late', status: 'running' as const }] : [] }))
+  on('clock.now', () => ({ value: now }))
+  on('ui.status', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: {} }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.py', agentId: 'a1' } as Parameters<typeof $.tool.call>[0])
+  isListed = true
+  now += 4000
+  await $.tool.call({ tool: 'Read', file_path: '/repo/b.py', agentId: 'a1' } as Parameters<typeof $.tool.call>[0])
+  const band = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await band.find({ type: 'Text', text: /①/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('subagent rows set to 끄기 draw no rows and no "더 보기"', { options: { agentRows: '끄기' } }, async ($, on) => {
+  on('agent.list', () => ({ value: ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'].map(id => ({ id, type: 'Explore', description: id, status: 'running' as const })) }))
+  on('clock.now', () => ({ value: Date.UTC(2026, 9, 6, 10) }))
+  on('ui.status', () => ({ value: undefined }))
+  on('settings.read', () => ({ value: {} }))
+  on('tool.call', () => ({ result: 'ok' }))
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box key="engine" />
+  })
+  for (const id of ['a1', 'a2', 'a3', 'a4', 'a5', 'a6']) {
+    await $.tool.call({ tool: 'Read', file_path: '/repo/a.py', agentId: id } as Parameters<typeof $.tool.call>[0])
+  }
+  const band = await $.ui.mount({ plugin: 'token-usage', surface: 'terminal', ...BAND })
+  expect(await band.find({ type: 'Text', text: /①/ })).toBeUndefined()
+  expect(await band.find({ type: 'Button', key: 'agent:more' })).toBeUndefined()
+  await band.unmount()
+})

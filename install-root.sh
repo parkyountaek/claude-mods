@@ -21,6 +21,8 @@ if os.path.exists(path) and os.path.getsize(path):
         data = json.load(open(path))
     except ValueError as err:
         sys.exit(f"{path} 이 올바른 JSON 이 아니라서 바꾸지 않았습니다 ({err}). 파일을 고친 뒤 다시 실행하세요.")
+if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+    sys.exit(f"{path} 의 모양이 예상과 달라(맨 바깥이나 env 가 객체가 아님) 바꾸지 않았습니다.")
 env = data.setdefault("env", {})
 dirs = [d for d in env.get("CLAUDE_CODE_PLUGIN_DIRS", "").split(":") if d]
 wanted = [f"{mods}/{m}" for m in ("token-usage", "work-alerts", "compact-handoff")]
@@ -40,6 +42,10 @@ fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
 with os.fdopen(fd, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
+if os.path.exists(path):
+    os.chmod(tmp, os.stat(path).st_mode & 0o777)
+else:
+    os.chmod(tmp, 0o644)
 os.replace(tmp, path)
 print("등록 완료:", path)
 PY

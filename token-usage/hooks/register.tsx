@@ -142,7 +142,7 @@ export const resetsIn = (resetsAt: string | undefined, now: number): string => {
   if (!resetsAt) return ''
   const min = Math.round((Date.parse(resetsAt) - now) / 60_000)
   if (Number.isNaN(min)) return ''
-  if (min < 1) return '↻ now'
+  if (min < 1) return '↻곧'
   if (min < 60) return `↻${min}m`
   const h = Math.floor(min / 60)
   if (h < 24) return `↻${h}h`
@@ -301,6 +301,8 @@ const syncAgents = async ($: EngineInterface) => {
     ...u,
     agents: u.agents.map(a => {
       const info = roster.find(r => r.id === a.id)
+      // Gone from the roster while still marked running: it ended without telling us.
+      if (!info && isLive(a) && known.has(a.id)) return { ...a, status: 'killed', endedAt: a.endedAt ?? Date.now() }
       return info
         ? {
             ...a,
@@ -366,14 +368,19 @@ const ctxPercent = (a: AgentRow, u: Usage): number | undefined =>
 
 // Engine forks (compaction, memory) and workflow agents carry ids the roster never lists:
 // only ids the roster knows get a row, so no row is left "running" forever.
+// A miss is rechecked after a few seconds, in case the roster was still catching up.
 const known = new Set<string>()
-const ignored = new Set<string>()
+const ignored = new Map<string, number>()
+const RECHECK_MS = 3000
 const isTracked = async ($: EngineInterface, id: string): Promise<boolean> => {
   if (known.has(id)) return true
-  if (ignored.has(id)) return false
+  const now = await $.clock.now()
+  const missedAt = ignored.get(id)
+  if (missedAt !== undefined && now - missedAt < RECHECK_MS) return false
   const roster = await $.agent.list().catch(() => [])
   for (const r of roster) known.add(r.id)
-  if (!known.has(id)) ignored.add(id)
+  if (known.has(id)) ignored.delete(id)
+  else ignored.set(id, now)
   return known.has(id)
 }
 
@@ -421,6 +428,7 @@ const toggleAgentView = async ($: EngineInterface, id: string, view: View, isTab
   })
   if (!placed.isPlaced) {
     await update($, usage, x => ({ ...x, viewing: undefined }))
+    await $.ui.close({ id: AGENT_PANE }).catch(() => undefined)
     $.ui.toast('창을 열 자리가 없습니다. 터미널을 넓히고 다시 눌러 주세요.', { timeoutMs: 5000 })
   }
 }
@@ -458,6 +466,7 @@ export const register: Register = (on, options) => {
     const arg = e.args.trim()
     const words = arg.split(/\s+/)
     if (words[0] === 'theme' || words[0] === 'color') {
+      if (opts.theme) return { text: `/config 의 token-usage 색 테마가 "${opts.theme}"(으)로 정해져 있어 이 명령으로는 바뀌지 않습니다. /config 에서 '파일 설정 따름'으로 바꾼 뒤 다시 해 주세요.` }
       const r = await themeCommand($, words)
       if (r.theme) {
         const theme = r.theme
@@ -648,7 +657,7 @@ export const register: Register = (on, options) => {
     const nameWidth = isNarrow ? 14 : 24
     const agentRows = [
       // The agent being viewed keeps its row after it finishes, until its pane is closed.
-      ...[...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !isLive(x))].map(a => {
+      ...[...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !live.slice(0, MAX_AGENT_ROWS).includes(x))].map(a => {
         const tag = tagOf(a, u)
         const cp = ctxPercent(a, u)
         const isViewing = a.id === viewing
@@ -686,7 +695,7 @@ export const register: Register = (on, options) => {
           </Box>
         )
       }),
-      ...(live.length > MAX_AGENT_ROWS
+      ...(MAX_AGENT_ROWS > 0 && live.length > MAX_AGENT_ROWS
         ? [
             <Box key="agent:more">
               <Text>{viewing === AGENT_LIST ? '👁 ' : '   '}</Text>
