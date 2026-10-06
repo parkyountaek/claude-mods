@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit, TurnUsage } from 'claude-code'
+import type { EngineInterface, Register, SessionContextUsage, SessionMessage, SessionRateLimit, TurnUsage } from 'claude-code'
 
 import type { AgentRow, Context, Limit, Tokens, Usage } from '../types'
 
@@ -268,6 +268,8 @@ const syncAgents = async ($: EngineInterface) => {
 }
 
 const AGENT_PANE = 'agent-view'
+// `viewing` set to this shows every subagent of the session to pick from.
+const AGENT_LIST = '*'
 
 // What a tool call looks at, in a few words: "Read stockbot/cli.py", "Bash grep -n add_parser".
 export const activityOf = (tool: string, input: Record<string, unknown>): string => {
@@ -279,6 +281,39 @@ export const activityOf = (tool: string, input: Record<string, unknown>): string
   return clip(`${tool} ${short}`.trim(), 60)
 }
 
+type Line = { kind: 'ask' | 'say' | 'tool' | 'result'; text: string; arg?: string; isError?: boolean }
+
+// A subagent's messages as the main transcript draws them: "> prompt", "● reply",
+// "● Read(path)" and its "⎿ result" under it, one entry per screen row.
+export const transcriptLines = (messages: readonly SessionMessage[], width: number): Line[] => {
+  const out: Line[] = []
+  const wrap = (text: string, prefix: string, max: number) =>
+    text
+      .split('\n')
+      .filter(l => l.trim())
+      .slice(0, max)
+      .map((l, i) => `${i === 0 ? prefix : ' '.repeat(prefix.length)}${clip(l, width - prefix.length)}`)
+  for (const m of messages) {
+    const text = m.text.trim()
+    if (m.role === 'user') {
+      if (text) for (const t of wrap(text, '> ', 4)) out.push({ kind: 'ask', text: t })
+      continue
+    }
+    if (text) for (const t of wrap(text, '● ', 6)) out.push({ kind: 'say', text: t })
+    for (const t of m.toolUses) {
+      const act = activityOf(t.tool, t.input)
+      out.push({ kind: 'tool', text: t.tool, arg: clip(act.slice(t.tool.length).trim(), width - t.tool.length - 6) })
+      const res = t.text?.split('\n').find(l => l.trim())
+      out.push({
+        kind: 'result',
+        text: res === undefined ? (t.result === undefined ? '실행 중…' : '완료') : clip(res.trim(), width - 6),
+        isError: t.isError === true,
+      })
+    }
+  }
+  return out
+}
+
 const ctxPercent = (a: AgentRow, u: Usage): number | undefined =>
   a.ctxTokens ? Math.min(100, Math.round((a.ctxTokens / windowFor(a.model, u)) * 100)) : undefined
 
@@ -286,7 +321,10 @@ const isAgentPaneUp = async ($: EngineInterface) =>
   (await $.ui.panes()).some(p => p.id === AGENT_PANE && p.isPlaced)
 
 // A press on a subagent's row opens its transcript in a pane; pressing the one shown closes it.
-const toggleAgentView = async ($: EngineInterface, id: string) => {
+type View = { columns?: number; rows?: number } | undefined
+
+// Opened focused and near full size, so it reads as the main view switching to that agent.
+const toggleAgentView = async ($: EngineInterface, id: string, view: View) => {
   const u = await read($, usage)
   if (u.viewing === id && (await isAgentPaneUp($))) {
     await update($, usage, x => ({ ...x, viewing: undefined }))
@@ -296,7 +334,14 @@ const toggleAgentView = async ($: EngineInterface, id: string) => {
   const a = u.agents.find(x => x.id === id)
   const tag = agentTag(a ? u.agents.indexOf(a) : 0)
   await update($, usage, x => ({ ...x, viewing: id }))
-  await $.ui.open({ id: AGENT_PANE, title: `${tag.mark} ${a?.description || a?.type || '서브에이전트'}`, closeOnEscape: true })
+  await $.ui.open({
+    id: AGENT_PANE,
+    title: id === AGENT_LIST ? '서브에이전트 목록' : `${tag.mark} ${a?.description || a?.type || '서브에이전트'}`,
+    focus: true,
+    closeOnEscape: true,
+    rows: Math.max(10, (view?.rows ?? 30) - 8),
+    columns: Math.max(60, (view?.columns ?? 100) - 20),
+  })
 }
 
 // ---------------------------------------------------------------- hooks
@@ -476,7 +521,7 @@ export const register: Register = on => {
               key={`agent:${a.id}`}
               plain
               label={fit(clip(a.description || a.type, nameWidth), nameWidth)}
-              onPress={() => toggleAgentView($, a.id)}
+              onPress={() => toggleAgentView($, a.id, e.viewport)}
             />
             <Text> </Text>
             <Text bold>{a.model ? modelName(a.model).replace(/ 1M$/, '') : '?'}</Text>
@@ -493,7 +538,19 @@ export const register: Register = on => {
           </Box>
         )
       }),
-      ...(live.length > MAX_AGENT_ROWS ? [<Text dimColor>  🤖 외 {live.length - MAX_AGENT_ROWS}개 (/token-usage)</Text>] : []),
+      ...(live.length > MAX_AGENT_ROWS
+        ? [
+            <Box key="agent:more">
+              <Text>{viewing === AGENT_LIST ? '👁 ' : '   '}</Text>
+              <Button
+                key="agent:more"
+                plain
+                label={`🤖 외 ${live.length - MAX_AGENT_ROWS}개 더 보기`}
+                onPress={() => toggleAgentView($, AGENT_LIST, e.viewport)}
+              />
+            </Box>,
+          ]
+        : []),
     ]
 
     if (!u.isExpanded) {
@@ -583,38 +640,93 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const u = await read($, usage)
     const P = themeOf(u)
+    const { Button } = $.ui.resolve(e)
+    const width = Math.max(20, (e.props.bodyColumns ?? e.viewport?.columns ?? 60) - 2)
+    const view = e.viewport
+    // Running first, then the latest finished: every subagent stays one press away.
+    const ordered = [...u.agents.filter(isLive), ...u.agents.filter(x => !isLive(x)).reverse()]
+    const tabs = (
+      <Box key="tabs" flexWrap="wrap">
+        <Button key="tab:*" plain label={u.viewing === AGENT_LIST ? '[목록]' : ' 목록 '} onPress={() => toggleAgentView($, AGENT_LIST, view)} />
+        {ordered.slice(0, 12).map(x => {
+          const t = agentTag(u.agents.indexOf(x))
+          const isOn = x.id === u.viewing
+          return (
+            <Button
+              key={`tab:${x.id}`}
+              plain
+              label={`${isOn ? '[' : ' '}${t.mark}${isLive(x) ? '' : '✓'} ${clip(x.description || x.type, 10)}${isOn ? ']' : ' '}`}
+              onPress={() => toggleAgentView($, x.id, view)}
+            />
+          )
+        })}
+      </Box>
+    )
+    if (u.viewing === AGENT_LIST) {
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text dimColor>{'─'.repeat(Math.min(width, 80))}</Text>
+          {ordered.length === 0 && <Text dimColor>아직 서브에이전트가 없습니다.</Text>}
+          {ordered.map(x => {
+            const t = agentTag(u.agents.indexOf(x))
+            const xp = ctxPercent(x, u)
+            return (
+              <Box key={`row:${x.id}`}>
+                <Text bold color={P[t.tone]}>{t.mark} </Text>
+                <Button key={`pick:${x.id}`} plain label={fit(clip(x.description || x.type, 24), 24)} onPress={() => toggleAgentView($, x.id, view)} />
+                <Text bold> {x.model ? modelName(x.model).replace(/ 1M$/, '') : '?'}</Text>
+                {x.effort && <Text dimColor> {x.effort}</Text>}
+                <Text color={isLive(x) ? P.warn : P.ok}> {isLive(x) ? '실행 중' : '끝남'}</Text>
+                <Text dimColor> · ctx {xp !== undefined ? `${xp}%` : '-'}</Text>
+                {x.activity && <Text dimColor> · {clip(x.activity, Math.max(10, width - 70))}</Text>}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
     const a = u.agents.find(x => x.id === u.viewing)
-    if (!a) return <Text dimColor>위 줄에서 서브에이전트 이름을 누르면 여기에 그 작업 내용이 나옵니다.</Text>
+    if (!a) return <Box flexDirection="column">{tabs}<Text dimColor>위 줄에서 서브에이전트 이름을 누르면 여기에 그 작업 내용이 나옵니다.</Text></Box>
     const tag = agentTag(u.agents.indexOf(a))
     const cp = ctxPercent(a, u)
     const found = await $.session.messages({ agentId: a.id })
-    const width = Math.max(20, (e.viewport?.columns ?? 60) - 4)
-    const lines: { kind: 'ask' | 'say' | 'tool'; text: string }[] = []
-    for (const m of 'deny' in found ? [] : found) {
-      const text = m.text.trim()
-      if (text) for (const l of text.split('\n').filter(Boolean).slice(0, 3)) lines.push({ kind: m.role === 'user' ? 'ask' : 'say', text: l })
-      for (const t of m.toolUses) lines.push({ kind: 'tool', text: activityOf(t.tool, t.input) })
-    }
-    const room = Math.max(3, (e.viewport?.rows ?? 24) - 5)
+    const lines = transcriptLines('deny' in found ? [] : found, width)
+    const room = Math.max(3, (e.viewport?.rows ?? 24) - 6)
     const STATUS: Record<string, string> = { running: '실행 중', pending: '대기', waiting: '기다리는 중', completed: '끝남', failed: '실패', killed: '중단' }
+    const isLiveNow = isLive(a)
     return (
       <Box flexDirection="column">
+        {tabs}
         <Text>
-          <Text bold color={P[tag.tone]}>{tag.mark} {a.description || a.type}</Text>
-          <Text dimColor> · </Text>
-          <Text bold>{a.model ? modelName(a.model) : '?'}</Text>
-          {a.effort && <Text dimColor> {a.effort}</Text>}
-          <Text dimColor> · {STATUS[a.status] ?? a.status} · ctx {cp !== undefined ? `${cp}%` : '-'}</Text>
-        </Text>
-        <Text dimColor>{'─'.repeat(Math.min(width, 60))}</Text>
-        {'deny' in found && <Text dimColor>이 서브에이전트의 기록을 읽을 수 없습니다.</Text>}
-        {lines.slice(-room).map(l => (
-          <Text dimColor={l.kind === 'ask'} color={l.kind === 'tool' ? P.cache : undefined}>
-            {l.kind === 'tool' ? '🔧 ' : l.kind === 'ask' ? '📝 ' : '💬 '}
-            {clip(l.text, width - 3)}
+          <Text backgroundColor={P[tag.tone]} color={P.chipText} bold>
+            {` ${tag.mark} ${a.description || a.type} `}
           </Text>
-        ))}
-        <Text dimColor>이름을 다시 누르거나 Esc로 닫기</Text>
+          <Text bold> {a.model ? modelName(a.model) : '?'}</Text>
+          {a.effort && <Text dimColor> {a.effort}</Text>}
+          <Text color={isLiveNow ? P.warn : P.ok}> · {STATUS[a.status] ?? a.status}</Text>
+          <Text dimColor> · ctx {cp !== undefined ? `${cp}%` : '-'} · Esc: 메인으로</Text>
+        </Text>
+        {'deny' in found && <Text dimColor>이 서브에이전트의 기록을 읽을 수 없습니다.</Text>}
+        {lines.slice(-room).map(l =>
+          l.kind === 'ask' ? (
+            <Text dimColor>{l.text}</Text>
+          ) : l.kind === 'tool' ? (
+            <Text>
+              <Text color={P.ok}>● </Text>
+              <Text bold>{l.text}</Text>
+              {l.arg && <Text>({l.arg})</Text>}
+            </Text>
+          ) : l.kind === 'result' ? (
+            <Text color={l.isError ? P.danger : undefined} dimColor={!l.isError}>
+              {'  ⎿  '}
+              {l.text}
+            </Text>
+          ) : (
+            <Text>{l.text}</Text>
+          ),
+        )}
+        {isLiveNow && <Text color={P.warn}>✻ 작업 중…</Text>}
       </Box>
     )
   })
