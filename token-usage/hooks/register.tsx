@@ -214,6 +214,24 @@ export const elapsed = (ms: number): string => {
 export const agentElapsed = (a: AgentRow, now: number): string | undefined =>
   a.startedAt === undefined ? undefined : elapsed((a.endedAt ?? now) - a.startedAt)
 
+// Children right under their parent, each with its depth, so a spawned subagent sits
+// indented below the one that spawned it.
+export const nested = (rows: readonly AgentRow[]): { a: AgentRow; depth: number }[] => {
+  const ids = new Set(rows.map(r => r.id))
+  const out: { a: AgentRow; depth: number }[] = []
+  const walk = (parent: string | undefined, depth: number) => {
+    for (const r of rows) {
+      const p = r.parentId !== undefined && ids.has(r.parentId) ? r.parentId : undefined
+      if (p === parent && !out.some(o => o.a === r) && depth < 6) {
+        out.push({ a: r, depth })
+        walk(r.id, depth + 1)
+      }
+    }
+  }
+  walk(undefined, 0)
+  return out
+}
+
 // A turn's end reason as the agent's final status.
 export const endStatus = (reason: string): string =>
   reason === 'aborted' ? 'killed' : reason === 'error' || reason === 'refusal' ? 'failed' : 'completed'
@@ -307,6 +325,7 @@ const syncAgents = async ($: EngineInterface) => {
         ? {
             ...a,
             type: info.type,
+            parentId: info.parentId,
             description: info.description,
             status: info.status,
             endedAt: ['completed', 'failed', 'killed'].includes(info.status) ? (a.endedAt ?? Date.now()) : a.endedAt,
@@ -657,7 +676,7 @@ export const register: Register = (on, options) => {
     const nameWidth = isNarrow ? 14 : 24
     const agentRows = [
       // The agent being viewed keeps its row after it finishes, until its pane is closed.
-      ...[...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !live.slice(0, MAX_AGENT_ROWS).includes(x))].map(a => {
+      ...nested([...live.slice(0, MAX_AGENT_ROWS), ...u.agents.filter(x => x.id === viewing && !live.slice(0, MAX_AGENT_ROWS).includes(x))]).map(({ a, depth }) => {
         const tag = tagOf(a, u)
         const cp = ctxPercent(a, u)
         const isViewing = a.id === viewing
@@ -665,6 +684,7 @@ export const register: Register = (on, options) => {
         return (
           <Box key={`agent:${a.id}`}>
             <Text color={P.accent}>{isViewing ? '👁 ' : '  '}</Text>
+            {depth > 0 && <Text dimColor>{`${'  '.repeat(depth - 1)}└ `}</Text>}
             <Text bold color={P[tag.tone]}>{tag.mark} </Text>
             <Button
               key={`agent:${a.id}`}
@@ -826,11 +846,12 @@ export const register: Register = (on, options) => {
           {tabs}
           <Text dimColor>{'─'.repeat(Math.min(width, 80))}</Text>
           {ordered.length === 0 && <Text dimColor>아직 서브에이전트가 없습니다.</Text>}
-          {ordered.map(x => {
+          {nested(ordered).map(({ a: x, depth }) => {
             const t = tagOf(x, u)
             const xp = ctxPercent(x, u)
             return (
               <Box key={`row:${x.id}`}>
+                {depth > 0 && <Text dimColor>{`${'  '.repeat(depth - 1)}└ `}</Text>}
                 <Text bold color={P[t.tone]}>{t.mark} </Text>
                 <Button key={`pick:${x.id}`} plain label={fit(clip(x.description || x.type, 24), 24)} onPress={() => toggleAgentView($, x.id, view, true)} />
                 <Text bold> {x.model ? modelName(x.model).replace(/ 1M$/, '') : '?'}</Text>

@@ -24,6 +24,8 @@ export type AgentRow = Tokens & {
   ctxTokens?: number
   // Its latest tool call, as "Read docs/spec.md": what it is looking at now.
   activity?: string
+  // The subagent that spawned this one; absent when the main loop did.
+  parentId?: string
 }
 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }

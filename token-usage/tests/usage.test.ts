@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import {
   agentTag,
+  nested,
   addAgentRun,
   addMainTurn,
   agentModels,
@@ -113,4 +114,10 @@ test('subagents get distinct numbers and colors', () => {
   expect(agentTag(1).mark).toBe('②')
   expect(agentTag(0).tone).not.toBe(agentTag(1).tone)
   expect(agentTag(20).mark).toBe('(21)')
+})
+
+test('spawned subagents sit under the one that spawned them', () => {
+  const row = (id: string, parentId?: string) => ({ id, parentId, type: 'x', description: id, model: '', status: 'running', runs: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
+  const out = nested([row('a'), row('b'), row('c', 'a'), row('d', 'c'), row('e', 'gone')])
+  expect(out.map(o => `${o.a.id}${o.depth}`)).toEqual(['a0', 'c1', 'd2', 'b0', 'e0'])
 })
