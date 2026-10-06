@@ -27,15 +27,65 @@ const clip = (s: string, n: number) => {
   return t.length > n ? `${t.slice(0, n)}…` : t
 }
 
+// The engine's compaction summary opens the continued conversation as a user message.
+const SUMMARY_START = /^(This session is being continued|<compact|Summary of the conversation)/i
+
 const isTypedPrompt = (m: SessionMessage) =>
   m.role === 'user' &&
   m.text.trim() !== '' &&
   !(m.toolResults?.length) &&
   !m.text.startsWith(TAG) &&
+  !SUMMARY_START.test(m.text.trimStart()) &&
   !m.text.trimStart().startsWith('<')
+
+const STATUS_OF: Record<string, string> = { '[x]': 'completed', '[>]': 'in_progress', '[ ]': 'pending' }
+
+// Reads a note `render` wrote back into its parts, so a second compaction keeps the first one's.
+export const parseNote = (note: string): Handoff => {
+  const hand: Handoff = { prompts: [], tasks: [], files: [], failures: [], lastStep: '' }
+  let section = ''
+  const last: string[] = []
+  for (const line of note.split('\n')) {
+    if (line.startsWith('## ')) {
+      section = line.slice(3)
+      continue
+    }
+    if (section.startsWith("User's requests")) {
+      const m = /^\d+\. (.*)$/.exec(line)
+      if (m?.[1]) hand.prompts.push(m[1])
+    } else if (section === 'Task list') {
+      const m = /^(\[[x> ]\]) (.*)$/.exec(line)
+      if (m?.[1] && m[2]) hand.tasks.push({ subject: m[2], status: STATUS_OF[m[1]] ?? 'pending' })
+    } else if (section === 'Files touched' && line.startsWith('- ')) hand.files.push(line.slice(2))
+    else if (section === 'Recent failed commands' && line.startsWith('- ')) hand.failures.push(line.slice(2))
+    else if (section.startsWith('Last assistant message') && !line.startsWith('Next: ')) last.push(line)
+  }
+  hand.lastStep = last.join('\n').trim()
+  return hand
+}
+
+// What the earlier note held comes first; what happened since is laid over it.
+export const mergeHandoff = (before: Handoff, now: Handoff): Handoff => {
+  const prompts = [...before.prompts, ...now.prompts.filter(p => !before.prompts.includes(p))]
+  const bySubject = new Map(before.tasks.map(t => [t.subject, t]))
+  for (const t of now.tasks) bySubject.set(t.subject, t)
+  return {
+    prompts: prompts.length > KEEP_PROMPTS ? [prompts[0] ?? '', ...prompts.slice(-(KEEP_PROMPTS - 1))] : prompts,
+    tasks: [...bySubject.values()],
+    files: [...new Set([...before.files, ...now.files])].slice(-KEEP_FILES),
+    failures: (now.failures.length ? now.failures : before.failures).slice(-3),
+    lastStep: now.lastStep || before.lastStep,
+  }
+}
 
 // Everything here is read from the transcript itself, so it survives reloads.
 export const collect = (messages: readonly SessionMessage[]): Handoff => {
+  const earlier = [...messages].reverse().find(m => m.role === 'user' && m.text.startsWith(TAG))
+  const fresh = collectFresh(messages)
+  return earlier ? mergeHandoff(parseNote(earlier.text), fresh) : fresh
+}
+
+const collectFresh = (messages: readonly SessionMessage[]): Handoff => {
   const typed = messages.filter(isTypedPrompt).map(m => clip(m.text, 300))
   const prompts = typed.length > KEEP_PROMPTS ? [typed[0] ?? '', ...typed.slice(-(KEEP_PROMPTS - 1))] : typed
 

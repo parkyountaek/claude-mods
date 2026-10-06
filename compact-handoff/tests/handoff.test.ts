@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { SessionMessage } from 'claude-code'
 
-import { bar, collect, INSTRUCTIONS, progress, render, shortPath } from '../hooks/register'
+import { bar, collect, INSTRUCTIONS, parseNote, progress, render, shortPath } from '../hooks/register'
 
 const user = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
 const said = (text: string, toolUses: SessionMessage['toolUses'] = []): SessionMessage => ({
@@ -76,4 +76,27 @@ test('progress, bar and short paths for the work pane', async () => {
   expect(bar(1, 3, 6)).toBe('██····')
   expect(shortPath('/repo/src/x.py', '/repo')).toBe('src/x.py')
   expect(shortPath('/Users/pyt/.claude/a.ts', '/repo')).toBe('~/.claude/a.ts')
+})
+
+test('a note reads back into the same parts', () => {
+  const hand = collect(TRANSCRIPT)
+  expect(parseNote(render(hand, '/repo'))).toEqual(hand)
+})
+
+test('a second compaction keeps what the first note held', () => {
+  const first = render(collect(TRANSCRIPT), '/repo')
+  const after: SessionMessage[] = [
+    user('This session is being continued from a previous conversation that ran out of context. Summary: ...'),
+    user(first),
+    user('테마도 바꿔줘'),
+    said('', [{ tool_use_id: 'u1', tool: 'Edit', input: { file_path: '/m/theme.ts' } }]),
+    said('Theme done; tests next.'),
+  ]
+  const hand = collect(after)
+  expect(hand.prompts[0]).toBe('mods 설정하고 싶어')
+  expect(hand.prompts).toContain('테마도 바꿔줘')
+  expect(hand.prompts.some(p => p.startsWith('This session'))).toBe(false)
+  expect(hand.tasks.map(t => t.subject)).toEqual(['write mod', 'run tests'])
+  expect(hand.files).toEqual(['/m/register.ts', '/m/theme.ts'])
+  expect(hand.lastStep).toBe('Theme done; tests next.')
 })
